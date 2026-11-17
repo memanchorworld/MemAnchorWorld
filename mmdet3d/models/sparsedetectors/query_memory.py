@@ -1,0 +1,2946 @@
+import math
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import List, Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+_EPS = 1e-6
+
+
+def _as_float(value, default=None):
+    if value is None:
+        return default
+    if isinstance(value, torch.Tensor):
+        return float(value.detach().cpu().reshape(-1)[0].item())
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return default
+        return _as_float(value[0], default)
+    return float(value)
+
+
+def decode_points_metric(points, pc_range):
+    """Decode normalized SparseWorld points to metric coordinates."""
+    pc_range = torch.as_tensor(pc_range, device=points.device, dtype=points.dtype)
+    out = points.clone()
+    out[..., 0] = out[..., 0] * (pc_range[3] - pc_range[0]) + pc_range[0]
+    out[..., 1] = out[..., 1] * (pc_range[4] - pc_range[1]) + pc_range[1]
+    out[..., 2] = out[..., 2] * (pc_range[5] - pc_range[2]) + pc_range[2]
+    return out
+
+
+def encode_points_normalized(points_metric, pc_range):
+    """Encode metric points back to SparseWorld normalized coordinates."""
+    pc_range = torch.as_tensor(
+        pc_range, device=points_metric.device, dtype=points_metric.dtype)
+    out = points_metric.clone()
+    out[..., 0] = (out[..., 0] - pc_range[0]) / (pc_range[3] - pc_range[0])
+    out[..., 1] = (out[..., 1] - pc_range[1]) / (pc_range[4] - pc_range[1])
+    out[..., 2] = (out[..., 2] - pc_range[2]) / (pc_range[5] - pc_range[2])
+    return out
+
+
+def apply_metric_position_residual(base_points, delta_metric, pc_range,
+                                   active_mask=None):
+    """Apply metric residuals while preserving exact encoded-space identity.
+
+    SparseWorld point proposals use the linear normalisation implemented by
+    decode_points_metric and encode_points_normalized. Only active points are
+    converted. The encoded change is added to the original representation, so
+    a zero metric residual produces an exact zero change and inactive points
+    are returned byte-for-byte.
+    """
+    if base_points.dim() != 4 or base_points.shape[-1] != 3:
+        raise ValueError(
+            'base_points must have shape [B,Q,R,3], got '
+            f'{tuple(base_points.shape)}')
+    if delta_metric.shape != base_points.shape:
+        raise ValueError(
+            'delta_metric must match base_points, got '
+            f'{tuple(delta_metric.shape)} and {tuple(base_points.shape)}')
+    B, Q, R, _ = base_points.shape
+    if active_mask is None:
+        active_mask = torch.ones(
+            B, Q, R, dtype=torch.bool, device=base_points.device)
+    else:
+        active_mask = active_mask.to(
+            device=base_points.device, dtype=torch.bool)
+        if active_mask.shape == (B, Q):
+            active_mask = active_mask.unsqueeze(-1).expand(B, Q, R)
+        if active_mask.shape != (B, Q, R):
+            raise ValueError(
+                'active_mask must have shape [B,Q] or [B,Q,R], got '
+                f'{tuple(active_mask.shape)}')
+    if not bool(active_mask.any()):
+        return base_points
+
+    base_flat = base_points.reshape(-1, 3)
+    delta_flat = delta_metric.reshape(-1, 3)
+    active_flat = active_mask.reshape(-1)
+    encoded_active = base_flat[active_flat]
+    decoded_base = decode_points_metric(encoded_active, pc_range)
+    encoded_base = encode_points_normalized(decoded_base, pc_range)
+    encoded_shifted = encode_points_normalized(
+        decoded_base + delta_flat[active_flat], pc_range)
+    encoded_delta = encoded_shifted - encoded_base
+    output = base_flat.clone()
+    output[active_flat] = encoded_active + encoded_delta
+    return output.reshape_as(base_points)
+
+
+def logits_to_query_confidence(logits):
+    """Sigmoid-max-mean confidence for independent semantic logits.
+
+    Args:
+        logits (Tensor): [B, Q, R, C_sem]
+
+    Returns:
+        Tensor: [B, Q] float32 confidence.
+    """
+    if logits.dim() != 4:
+        raise ValueError(
+            'query logits must have shape [B, Q, R, C_sem], '
+            f'got {tuple(logits.shape)}')
+    return logits.float().sigmoid().amax(dim=-1).mean(dim=-1)
+
+
+def compute_query_reliability(logits, eps=_EPS):
+    """Point-level semantic reliability for STAC-QM memory queries (schema v2).
+
+    Args:
+        logits (Tensor): per-point class logits ``[..., R, C]`` where ``C`` is
+            the number of semantic occupancy classes. NaN/Inf are sanitized
+            before the softmax so the result is always finite.
+
+    Returns:
+        dict (leading dims equal to ``logits.shape[:-2]``):
+            ``query_semantic_distribution`` ``[..., C]``
+            ``query_label``    ``[...]`` (long, ``-1`` for empty queries)
+            ``query_margin``   ``[...]``
+            ``query_entropy``  ``[...]``
+            ``query_reliability`` ``[...]`` in ``[0, 1]``
+
+    Reliability is the mean of three terms, each mapped to ``[0, 1]``:
+
+        ``top1``               = ``max_c mean_r softmax(logits)_c``
+        ``margin``             = ``top1 - top2``
+        ``normalized_entropy`` = ``1 - H(p) / log(C)``
+
+    with ``p`` the point-averaged distribution. This is a *semantic
+    reliability* over all ``C`` occupancy classes, NOT a foreground
+    probability: all 17 classes are semantic occupancy categories.
+    """
+    if logits.dim() < 2:
+        raise ValueError(
+            'compute_query_reliability expects [..., R, C], got '
+            f'{tuple(logits.shape)}')
+    logits = logits.float()
+    logits = torch.nan_to_num(logits, nan=0.0, posinf=30.0, neginf=-30.0)
+    lead = logits.shape[:-2]
+    num_points = logits.shape[-2]
+    num_classes = logits.shape[-1]
+    if num_points == 0 or num_classes == 0:
+        c = max(int(num_classes), 1)
+        return dict(
+            query_semantic_distribution=logits.new_zeros(*lead, c),
+            query_label=torch.full(
+                lead, -1, dtype=torch.long, device=logits.device),
+            query_margin=logits.new_zeros(*lead),
+            query_entropy=logits.new_zeros(*lead),
+            query_reliability=logits.new_zeros(*lead))
+    point_probs = F.softmax(logits, dim=-1)
+    dist = point_probs.mean(dim=-2)
+    dist = dist / dist.sum(dim=-1, keepdim=True).clamp_min(eps)
+    topk = torch.topk(dist, k=min(2, num_classes), dim=-1).values
+    top1 = topk[..., 0]
+    second = topk[..., 1] if num_classes >= 2 else torch.zeros_like(top1)
+    margin = (top1 - second).clamp(0.0, 1.0)
+    label = dist.argmax(dim=-1).long()
+    entropy = -(dist * torch.log(dist.clamp_min(eps))).sum(dim=-1)
+    norm_entropy = (1.0 - entropy / math.log(max(int(num_classes), 2))).clamp(
+        0.0, 1.0)
+    reliability = ((top1 + margin + norm_entropy) / 3.0).clamp(0.0, 1.0)
+    reliability = torch.nan_to_num(reliability, nan=0.0, posinf=1.0, neginf=0.0)
+    entropy = torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
+    margin = torch.nan_to_num(margin, nan=0.0, posinf=0.0, neginf=0.0)
+    return dict(
+        query_semantic_distribution=dist,
+        query_label=label,
+        query_margin=margin,
+        query_entropy=entropy,
+        query_reliability=reliability)
+
+
+def compute_effective_age(base_age, future_offset=0.0):
+    """Future-aware age: ``effective_age = base_age + future_offset`` (seconds).
+
+    ``base_age = t_current - t_history`` is stored in the cache/online bank and
+    NEVER mutated. ``future_offset`` is 0 for the observation query and
+    ``(k+1) * frame_interval`` for scheduled future query group ``k``.
+    """
+    if not torch.is_tensor(base_age):
+        base_age = torch.as_tensor(base_age, dtype=torch.float32)
+    return base_age.float() + float(future_offset)
+
+
+def select_diverse_memory_queries(points_metric,
+                                  reliability,
+                                  valid=None,
+                                  labels=None,
+                                  max_queries=256,
+                                  min_reliability=0.0,
+                                  spatial_cell_size=4.0,
+                                  max_per_spatial_cell=16,
+                                  max_per_class=64):
+    """Deterministic reliability + class + spatial diversity selection.
+
+    Shared by the cache precompute, the cache loader, and the online
+    ``QueryMemoryBank`` so all three obey identical selection rules.
+
+    Args:
+        points_metric (Tensor): ``[M, R, 3]`` metric points per query.
+        reliability   (Tensor): ``[M]`` reliability in ``[0, 1]``.
+        valid         (Tensor): optional ``[M]`` bool validity.
+        labels        (Tensor): optional ``[M]`` long semantic label. When
+            ``None`` or all ``-1`` (schema v1) class constraints are disabled
+            and selection degrades to spatial-diversity + reliability.
+
+    Returns:
+        LongTensor of selected original indices, deterministic order
+        (reliability desc, ties broken by ascending index).
+    """
+    reliability = reliability.float()
+    device = reliability.device
+    M = reliability.shape[0]
+    if M == 0:
+        return torch.zeros(0, dtype=torch.long, device=device)
+    keep = torch.isfinite(reliability) & (reliability >= float(min_reliability))
+    if valid is not None:
+        keep = keep & valid.to(device=device).bool()
+    cand = torch.nonzero(keep, as_tuple=False).flatten()
+    if cand.numel() == 0:
+        return torch.zeros(0, dtype=torch.long, device=device)
+    order = torch.argsort(reliability[cand], descending=True, stable=True)
+    cand_sorted = cand[order].tolist()
+
+    centers = points_metric.float().mean(dim=-2)  # [M, 3]
+    cell_size = float(spatial_cell_size)
+    use_labels = labels is not None
+    labels_list = labels.long().tolist() if use_labels else None
+    # if every label is -1 (unknown), disable class constraints entirely
+    if use_labels and all(l < 0 for l in labels_list):
+        use_labels = False
+
+    max_queries = int(max_queries)
+    max_per_cell = int(max_per_spatial_cell)
+    max_per_class = int(max_per_class)
+    cx = torch.floor(centers[:, 0] / cell_size).long().tolist()
+    cy = torch.floor(centers[:, 1] / cell_size).long().tolist()
+
+    selected = []
+    selected_set = set()
+    seen_cells = set()
+    seen_classes = set()
+    per_cell = {}
+    per_class = {}
+
+    def _cell(i):
+        return (cx[i], cy[i])
+
+    def _cls(i):
+        return labels_list[i] if use_labels else -1
+
+    # phase 1: prefer new class / new spatial cell, high reliability first
+    for i in cand_sorted:
+        if len(selected) >= max_queries:
+            break
+        cell = _cell(i)
+        cls = _cls(i)
+        if per_cell.get(cell, 0) >= max_per_cell:
+            continue
+        if use_labels and cls >= 0 and per_class.get(cls, 0) >= max_per_class:
+            continue
+        novel = cell not in seen_cells
+        if use_labels and cls >= 0:
+            novel = novel or (cls not in seen_classes)
+        if not novel:
+            continue
+        selected.append(i)
+        selected_set.add(i)
+        per_cell[cell] = per_cell.get(cell, 0) + 1
+        seen_cells.add(cell)
+        if use_labels and cls >= 0:
+            per_class[cls] = per_class.get(cls, 0) + 1
+            seen_classes.add(cls)
+
+    # phase 2: fill remaining capacity by reliability under caps
+    for i in cand_sorted:
+        if len(selected) >= max_queries:
+            break
+        if i in selected_set:
+            continue
+        cell = _cell(i)
+        cls = _cls(i)
+        if per_cell.get(cell, 0) >= max_per_cell:
+            continue
+        if use_labels and cls >= 0 and per_class.get(cls, 0) >= max_per_class:
+            continue
+        selected.append(i)
+        selected_set.add(i)
+        per_cell[cell] = per_cell.get(cell, 0) + 1
+        if use_labels and cls >= 0:
+            per_class[cls] = per_class.get(cls, 0) + 1
+
+    return torch.tensor(selected, dtype=torch.long, device=device)
+
+
+def safe_masked_softmax(scores, mask, dim=-1, eps=_EPS):
+    """Softmax that returns strict zeros for fully masked rows."""
+    if mask.dtype != torch.bool:
+        mask = mask.bool()
+    scores = scores.float()
+    mask = mask.to(device=scores.device)
+    has_candidate = mask.any(dim=dim, keepdim=True)
+    neg_inf = torch.finfo(scores.dtype).min
+    masked_scores = scores.masked_fill(~mask, neg_inf)
+    row_max = masked_scores.max(dim=dim, keepdim=True).values
+    row_max = torch.where(has_candidate, row_max, torch.zeros_like(row_max))
+    exp_scores = torch.where(
+        mask, torch.exp(masked_scores - row_max), torch.zeros_like(scores))
+    denom = exp_scores.sum(dim=dim, keepdim=True)
+    weights = exp_scores / denom.clamp_min(eps)
+    weights = torch.where(has_candidate, weights, torch.zeros_like(weights))
+    return weights
+
+
+def prepare_class_weights(class_weights, num_classes, device, dtype):
+    """Convert configured class weights without mutating the configuration.
+
+    All supported sources (list, tuple, CPU Tensor, or CUDA Tensor) take this
+    path before a V2 loss consumes them. Flattening creates the one-dimensional
+    shape required by PyTorch classification losses.
+    """
+    if class_weights is None:
+        return None
+    weights = torch.as_tensor(
+        class_weights, device=device, dtype=dtype).flatten()
+    actual = int(weights.numel())
+    expected = int(num_classes)
+    if actual != expected:
+        raise ValueError(
+            'V2 class_weights has '
+            f'{actual} entries, expected {expected} (num_classes)')
+    return weights
+
+
+def _inverse_softplus(value):
+    value = float(value)
+    if value <= 0:
+        return torch.tensor(-20.0, dtype=torch.float32)
+    return torch.log(torch.expm1(torch.tensor(value, dtype=torch.float32)))
+
+
+
+@dataclass
+class ObservationMemoryEntry:
+    query_feat: torch.Tensor
+    query_points_metric: torch.Tensor
+    query_conf: torch.Tensor
+    valid_mask: torch.Tensor
+    ego2global: torch.Tensor
+    timestamp: float
+    frame_idx: Optional[int]
+    scene_id: Optional[str]
+    sample_idx: Optional[str]
+    query_reliability: Optional[torch.Tensor] = None
+    query_label: Optional[torch.Tensor] = None
+
+
+class QueryMemoryBank:
+    """Online observation memory for strict sequential batch-size-one eval."""
+
+    def __init__(self,
+                 history_frames=3,
+                 max_queries_per_frame=256,
+                 write_threshold=0.35,
+                 max_time_gap=None,
+                 bank_size=None,
+                 confidence_threshold=None,
+                 history_selection_mode='recent',
+                 history_target_ages=(2.5, 3.5, 4.5),
+                 history_age_tolerance=0.35,
+                 visual_history_window=2.0,
+                 retention_seconds=5.0,
+                 max_bank_entries=16,
+                 min_reliability=0.0,
+                 spatial_cell_size=4.0,
+                 max_per_spatial_cell=16,
+                 max_per_class=64):
+        if bank_size is not None:
+            history_frames = bank_size
+        if confidence_threshold is not None:
+            write_threshold = confidence_threshold
+        self.history_frames = int(history_frames)
+        self.max_queries_per_frame = int(max_queries_per_frame)
+        self.write_threshold = float(write_threshold)
+        self.max_time_gap = max_time_gap
+        # Problem 5 (diversity) + Problem 6 (target-age history selection).
+        self.history_selection_mode = str(history_selection_mode)
+        self.history_target_ages = [float(a) for a in history_target_ages]
+        self.history_age_tolerance = float(history_age_tolerance)
+        self.visual_history_window = float(visual_history_window)
+        self.retention_seconds = (
+            None if retention_seconds is None else float(retention_seconds))
+        self.max_bank_entries = (
+            None if max_bank_entries is None else int(max_bank_entries))
+        self.min_reliability = float(min_reliability)
+        self.spatial_cell_size = float(spatial_cell_size)
+        self.max_per_spatial_cell = int(max_per_spatial_cell)
+        self.max_per_class = int(max_per_class)
+        self.entries: List[ObservationMemoryEntry] = []
+        self._last_scene_id = None
+        self._last_sample_idx = None
+        self._last_frame_idx = None
+        self._last_timestamp = None
+
+    def clear(self):
+        self.entries.clear()
+        self._last_scene_id = None
+        self._last_sample_idx = None
+        self._last_frame_idx = None
+        self._last_timestamp = None
+
+    def _maybe_reset_for_sequence(self, scene_id, sample_idx, frame_idx,
+                                  timestamp):
+        if self._last_scene_id is not None and scene_id != self._last_scene_id:
+            self.clear()
+            return 'scene_change'
+        if sample_idx is not None and sample_idx == self._last_sample_idx:
+            return 'duplicate_sample'
+        if frame_idx is not None and self._last_frame_idx is not None:
+            if frame_idx < self._last_frame_idx:
+                self.clear()
+                return 'frame_rollback'
+            if frame_idx == self._last_frame_idx:
+                return 'duplicate_frame'
+        if timestamp is not None and self._last_timestamp is not None:
+            if timestamp < self._last_timestamp:
+                self.clear()
+                return 'time_rollback'
+            if timestamp == self._last_timestamp:
+                return 'duplicate_timestamp'
+            if self.max_time_gap is not None:
+                if timestamp - self._last_timestamp > float(self.max_time_gap):
+                    self.clear()
+                    return 'time_gap_reset'
+        return None
+
+    def write(self,
+              query_feat,
+              query_points_metric,
+              cls_scores=None,
+              ego2global=None,
+              timestamp=None,
+              scene_id=None,
+              sample_idx=None,
+              frame_idx=None,
+              query_conf=None,
+              source_type='observation'):
+        del source_type
+        if query_feat.dim() != 3:
+            raise ValueError('query_feat must have shape [B, Q, C]')
+        if query_feat.shape[0] != 1:
+            raise RuntimeError(
+                'QueryMemoryBank online mode only supports batch_size=1; '
+                f'got B={query_feat.shape[0]}')
+        if query_points_metric.dim() != 4:
+            raise ValueError(
+                'query_points_metric must have shape [B, Q, R, 3]')
+        if ego2global is None:
+            raise ValueError('ego2global is required for query memory writes')
+        if ego2global.dim() == 2:
+            ego2global = ego2global.unsqueeze(0)
+        if ego2global.shape[0] != 1 or ego2global.shape[-2:] != (4, 4):
+            raise ValueError('ego2global must have shape [1, 4, 4] or [4, 4]')
+        timestamp = _as_float(timestamp, 0.0)
+        frame_idx = None if frame_idx is None else int(frame_idx)
+        sample_idx = None if sample_idx is None else str(sample_idx)
+        scene_id = None if scene_id is None else str(scene_id)
+
+        reset_reason = self._maybe_reset_for_sequence(
+            scene_id, sample_idx, frame_idx, timestamp)
+        if reset_reason and reset_reason.startswith('duplicate'):
+            return False
+
+        if query_conf is None:
+            if cls_scores is None:
+                raise ValueError('cls_scores or query_conf is required')
+            query_conf = logits_to_query_confidence(cls_scores)
+        if query_conf.dim() == 3 and query_conf.shape[-1] == 1:
+            query_conf = query_conf.squeeze(-1)
+        if query_conf.shape[:2] != query_feat.shape[:2]:
+            raise ValueError('query_conf must have shape [B, Q]')
+
+        conf = query_conf[0].detach().float().cpu()
+        points_cpu = query_points_metric[0].detach().float().cpu()
+
+        # schema-v2 per-query semantic reliability + label (Problem 4). When no
+        # class logits are available fall back to conf as reliability, label=-1.
+        if cls_scores is not None:
+            rel_dict = compute_query_reliability(cls_scores[0].detach().cpu())
+            reliability = rel_dict['query_reliability'].float()
+            labels = rel_dict['query_label'].long()
+        else:
+            reliability = conf.clone()
+            labels = torch.full((conf.shape[0],), -1, dtype=torch.long)
+
+        conf_ok = conf >= self.write_threshold
+        # deterministic reliability + class + spatial diversity (Problem 5),
+        # the SAME function the cache/loader use so online and offline agree.
+        sel = select_diverse_memory_queries(
+            points_cpu,
+            reliability,
+            valid=conf_ok,
+            labels=labels,
+            max_queries=self.max_queries_per_frame,
+            min_reliability=self.min_reliability,
+            spatial_cell_size=self.spatial_cell_size,
+            max_per_spatial_cell=self.max_per_spatial_cell,
+            max_per_class=self.max_per_class)
+        valid_inds = sel
+
+        entry = ObservationMemoryEntry(
+            query_feat=query_feat[0, valid_inds].detach().cpu(),
+            query_points_metric=points_cpu[valid_inds],
+            query_conf=conf[valid_inds],
+            valid_mask=torch.ones(valid_inds.numel(), dtype=torch.bool),
+            ego2global=ego2global[0].detach().float().cpu(),
+            timestamp=float(timestamp),
+            frame_idx=frame_idx,
+            scene_id=scene_id,
+            sample_idx=sample_idx,
+            query_reliability=reliability[valid_inds],
+            query_label=labels[valid_inds])
+        self.entries.append(entry)
+        self._prune_entries(float(timestamp))
+
+        self._last_scene_id = scene_id
+        self._last_sample_idx = sample_idx
+        self._last_frame_idx = frame_idx
+        self._last_timestamp = float(timestamp)
+        return True
+
+    def _prune_entries(self, current_timestamp):
+        """Bound the bank by retention window and entry count.
+
+        ``recent`` mode keeps the historical ``history_frames`` cap (so the
+        legacy right-aligned read is byte-for-byte unchanged). ``target_age``
+        mode keeps a wider bank governed by ``retention_seconds`` and
+        ``max_bank_entries`` so distant target ages remain reachable.
+        """
+        if self.history_selection_mode == 'recent':
+            cap = self.history_frames
+        else:
+            if self.retention_seconds is not None:
+                self.entries = [
+                    e for e in self.entries
+                    if current_timestamp - e.timestamp <= self.retention_seconds]
+            cap = (self.max_bank_entries if self.max_bank_entries is not None
+                   else self.history_frames)
+        if cap is not None:
+            while len(self.entries) > cap:
+                self.entries.pop(0)
+
+    def _causal_candidates(self, scene_id, sample_idx, frame_idx, timestamp):
+        """Strictly-past, same-scene entries with a positive base age."""
+        cands = []
+        for entry in self.entries:
+            if scene_id is not None and entry.scene_id != scene_id:
+                continue
+            if sample_idx is not None and entry.sample_idx == sample_idx:
+                continue
+            if frame_idx is not None and entry.frame_idx is not None:
+                if entry.frame_idx >= frame_idx:
+                    continue
+            age = timestamp - entry.timestamp
+            if age <= 0:
+                continue
+            cands.append((entry, age))
+        return cands
+
+    def _assign_target_age_slots(self, candidates):
+        """Greedily map candidates to target-age slots (Problem 6).
+
+        Slot ``j`` takes the strictly-past frame whose base age is closest to
+        ``history_target_ages[j]`` within ``history_age_tolerance``. No frame is
+        used by two slots; an unmatched slot stays invalid. Slot order follows
+        ``history_target_ages`` exactly.
+        """
+        assigned = {}
+        used = set()
+        for j, target in enumerate(self.history_target_ages):
+            best = None
+            best_gap = None
+            for idx, (entry, age) in enumerate(candidates):
+                if idx in used:
+                    continue
+                gap = abs(age - target)
+                if gap > self.history_age_tolerance:
+                    continue
+                if best is None or gap < best_gap:
+                    best = idx
+                    best_gap = gap
+            if best is not None:
+                used.add(best)
+                assigned[j] = candidates[best]
+        return assigned
+
+    def read(self,
+             scene_id=None,
+             sample_idx=None,
+             frame_idx=None,
+             timestamp=None,
+             device=None,
+             dtype=torch.float32):
+        if not self.entries:
+            return None
+        timestamp = _as_float(timestamp, 0.0)
+        frame_idx = None if frame_idx is None else int(frame_idx)
+        sample_idx = None if sample_idx is None else str(sample_idx)
+        scene_id = None if scene_id is None else str(scene_id)
+
+        candidates = self._causal_candidates(
+            scene_id, sample_idx, frame_idx, timestamp)
+        if not candidates:
+            return None
+
+        if self.history_selection_mode == 'target_age':
+            num_slots = len(self.history_target_ages)
+            assigned = self._assign_target_age_slots(candidates)
+            if not assigned:
+                return None
+            slot_entries = assigned  # {slot_index: (entry, age)}
+            template = next(iter(assigned.values()))[0]
+        else:
+            num_slots = self.history_frames
+            recent = candidates[-self.history_frames:]
+            offset = self.history_frames - len(recent)
+            slot_entries = {
+                offset + k: pair for k, pair in enumerate(recent)}
+            template = recent[0][0]
+
+        max_m = self.max_queries_per_frame
+        embed_dims = template.query_feat.shape[-1]
+        num_points = template.query_points_metric.shape[-2]
+        device = torch.device('cpu') if device is None else device
+        feat = torch.zeros(
+            1, num_slots, max_m, embed_dims, device=device, dtype=dtype)
+        points = torch.zeros(
+            1, num_slots, max_m, num_points, 3, device=device, dtype=dtype)
+        conf = torch.zeros(1, num_slots, max_m, device=device)
+        reliability = torch.zeros(1, num_slots, max_m, device=device)
+        label = torch.full(
+            (1, num_slots, max_m), -1, device=device, dtype=torch.long)
+        valid = torch.zeros(
+            1, num_slots, max_m, device=device, dtype=torch.bool)
+        source_ego = torch.eye(4, device=device).repeat(1, num_slots, 1, 1)
+        age = torch.zeros(1, num_slots, max_m, device=device)
+
+        for k, (entry, curr_age) in slot_entries.items():
+            n = min(entry.query_feat.shape[0], max_m)
+            if n == 0:
+                continue
+            feat[0, k, :n] = entry.query_feat[:n].to(device=device, dtype=dtype)
+            points[0, k, :n] = entry.query_points_metric[:n].to(
+                device=device, dtype=dtype)
+            conf[0, k, :n] = entry.query_conf[:n].to(device=device)
+            if entry.query_reliability is not None:
+                reliability[0, k, :n] = entry.query_reliability[:n].to(
+                    device=device)
+            else:
+                reliability[0, k, :n] = entry.query_conf[:n].to(device=device)
+            if entry.query_label is not None:
+                label[0, k, :n] = entry.query_label[:n].to(device=device)
+            source_ego[0, k] = entry.ego2global.to(device=device)
+            age[0, k, :n] = curr_age
+            valid[0, k, :n] = entry.valid_mask[:n].to(device=device)
+            valid[0, k, :n] &= curr_age > 0
+        return dict(
+            memory_query_feat=feat,
+            memory_points_metric=points,
+            memory_conf=conf,
+            memory_reliability=reliability,
+            memory_label=label,
+            memory_valid=valid,
+            memory_source_ego2global=source_ego,
+            memory_age=age)
+
+    def read_all(self, current_timestamp=0.0):
+        return self.read(timestamp=current_timestamp)
+
+    def __len__(self):
+        return len(self.entries)
+
+
+class EgoPoseAligner(nn.Module):
+    """Align metric points from source ego frames to current ego frame."""
+
+    def __init__(self, pc_range=None):
+        super().__init__()
+        if pc_range is None:
+            pc_range = [-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]
+        self.register_buffer(
+            'pc_range', torch.as_tensor(pc_range, dtype=torch.float32))
+
+    def forward(self, points_metric, source_ego2global, target_ego2global):
+        orig_dtype = points_metric.dtype
+        points = points_metric.float()
+        source = source_ego2global.to(points.device).float()
+        target = target_ego2global.to(points.device).float()
+
+        if points.dim() == 4:
+            if source.dim() == 2:
+                source = source.unsqueeze(0)
+            if target.dim() == 2:
+                target = target.unsqueeze(0)
+            transform = torch.linalg.inv(target) @ source
+            rotation = transform[..., :3, :3]
+            translation = transform[..., :3, 3]
+            aligned = (
+                torch.matmul(points, rotation.transpose(-1, -2)[:, None]) +
+                translation[:, None, None, :])
+        elif points.dim() == 5:
+            if source.dim() == 3:
+                source = source.unsqueeze(0)
+            if target.dim() == 2:
+                target = target.unsqueeze(0)
+            transform = torch.linalg.inv(target)[:, None] @ source
+            rotation = transform[..., :3, :3]
+            translation = transform[..., :3, 3]
+            aligned = (
+                torch.matmul(
+                    points, rotation.transpose(-1, -2)[:, :, None]) +
+                translation[:, :, None, None, :])
+        else:
+            raise ValueError(
+                'points_metric must have shape [B, M, R, 3] or '
+                f'[B, K, M, R, 3], got {tuple(points_metric.shape)}')
+        return aligned.to(orig_dtype)
+
+    def align_normalized(self, points_normalized, source_ego2global,
+                         target_ego2global):
+        metric = decode_points_metric(points_normalized, self.pc_range)
+        aligned = self.forward(metric, source_ego2global, target_ego2global)
+        return encode_points_normalized(aligned, self.pc_range)
+
+
+class QueryMotionCompensator(nn.Module):
+    """Zero-initialized, ego-independent object-motion residual.
+
+    Predicts a per-query velocity from the memory feature and its
+    ``effective_age`` and applies a single translation shared by all ``R``
+    points of a query::
+
+        v_i     = v_max * tanh(MLP[LN(m_i), phi(dt_i)])
+        P_hat_i = P_i(ego-aligned) + dt_i * v_i
+
+    The last linear layer is zero-initialized, so at initialization the module
+    is an exact no-op (``velocity == 0``) and the pipeline degrades to pure
+    ego-only alignment. It never overwrites the raw cached positions; the
+    compensated positions are only used for candidate distance/spatial gating.
+    """
+
+    def __init__(self, embed_dims=256, hidden_dims=None, max_velocity=20.0,
+                 max_age=8.0):
+        super().__init__()
+        hidden_dims = embed_dims if hidden_dims is None else int(hidden_dims)
+        self.embed_dims = int(embed_dims)
+        self.max_velocity = float(max_velocity)
+        self.max_age = float(max_age)
+        self.time_dims = 2
+        self.norm = nn.LayerNorm(self.embed_dims)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.embed_dims + self.time_dims, hidden_dims),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dims, 3))
+        # zero-init last layer -> exact no-op until trained
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def _time_features(self, effective_age):
+        age = effective_age.float()
+        norm = age / (self.max_age + _EPS)
+        return torch.stack([age, norm], dim=-1)
+
+    def forward(self, memory_feat, effective_age):
+        """Args: memory_feat ``[B, K, M, C]``, effective_age ``[B, K, M]``.
+
+        Returns velocity ``[B, K, M, 3]`` (metres/second).
+        """
+        proj_dtype = self.mlp[0].weight.dtype
+        feat = self.norm(memory_feat.to(proj_dtype))
+        time_feat = self._time_features(effective_age).to(proj_dtype)
+        mlp_in = torch.cat([feat, time_feat], dim=-1)
+        velocity = self.max_velocity * torch.tanh(self.mlp(mlp_in))
+        return velocity.float()
+
+
+class CausalQueryMemoryAttention(nn.Module):
+    """Spatio-temporal, reliability-aware causal multi-head memory read."""
+
+    def __init__(self,
+                 embed_dims=256,
+                 num_heads=8,
+                 dropout=0.0,
+                 lambda_position=1.0,
+                 lambda_time=1.0,
+                 lambda_reliability=None,
+                 lambda_confidence=1.0,
+                 lambda_pos=None,
+                 lambda_conf=None,
+                 spatial_radius=12.0,
+                 topk=32,
+                 max_age=3.0,
+                 pc_range=None):
+        super().__init__()
+        if lambda_pos is not None:
+            lambda_position = lambda_pos
+        if lambda_conf is not None:
+            lambda_confidence = lambda_conf
+        # legacy `lambda_confidence` maps to the reliability weight
+        if lambda_reliability is None:
+            lambda_reliability = lambda_confidence
+        if embed_dims % num_heads != 0:
+            raise ValueError(
+                'STAC-QM requires embed_dims % num_heads == 0, got '
+                f'embed_dims={embed_dims}, num_heads={num_heads}')
+        if spatial_radius is None or float(spatial_radius) <= 0:
+            raise ValueError('spatial_radius must be a positive float')
+        if int(topk) <= 0:
+            raise ValueError('topk must be a positive integer')
+        if float(max_age) <= 0:
+            raise ValueError('max_age must be a positive float')
+        self.embed_dims = int(embed_dims)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.embed_dims // self.num_heads
+        self.spatial_radius = float(spatial_radius)
+        self.topk = int(topk)
+        self.max_age = float(max_age)
+        self.q_proj = nn.Linear(embed_dims, embed_dims)
+        self.k_proj = nn.Linear(embed_dims, embed_dims)
+        self.v_proj = nn.Linear(embed_dims, embed_dims)
+        self.out_proj = nn.Linear(embed_dims, embed_dims)
+        self.dropout = nn.Dropout(float(dropout))
+        self.raw_lambda_position = nn.Parameter(
+            _inverse_softplus(lambda_position).repeat(self.num_heads))
+        self.raw_lambda_time = nn.Parameter(
+            _inverse_softplus(lambda_time).repeat(self.num_heads))
+        self.raw_lambda_reliability = nn.Parameter(
+            _inverse_softplus(lambda_reliability).repeat(self.num_heads))
+        if pc_range is None:
+            pc_range = [-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]
+        self.register_buffer(
+            'pc_range', torch.as_tensor(pc_range, dtype=torch.float32))
+        nn.init.zeros_(self.out_proj.bias)
+
+    def _project_heads(self, layer, tensor, seq_len):
+        proj_dtype = layer.weight.dtype
+        projected = layer(tensor.to(proj_dtype)).float()
+        return projected.view(
+            tensor.shape[0], seq_len, self.num_heads,
+            self.head_dim).permute(0, 2, 1, 3)
+
+    def forward(self,
+                query_feat,
+                query_points_metric,
+                memory_query_feat,
+                memory_points_metric,
+                memory_conf,
+                memory_age,
+                memory_valid,
+                memory_reliability=None):
+        """``memory_age`` is the future-aware EFFECTIVE age (base + offset).
+
+        ``memory_reliability`` is the schema-v2 reliability; when ``None`` the
+        legacy ``memory_conf`` is used as the reliability fallback.
+        """
+        B, Q, C = query_feat.shape
+        if C != self.embed_dims:
+            raise ValueError(
+                f'query feature dim {C} does not match embed_dims '
+                f'{self.embed_dims}')
+        if memory_query_feat is None or memory_query_feat.numel() == 0:
+            zeros = query_feat.new_zeros(B, Q, C)
+            return zeros, self._empty_diagnostics(B, Q, query_feat.device)
+
+        if memory_query_feat.dim() == 3:
+            memory_query_feat = memory_query_feat.unsqueeze(0)
+            memory_points_metric = memory_points_metric.unsqueeze(0)
+            memory_conf = memory_conf.unsqueeze(0)
+            memory_age = memory_age.unsqueeze(0)
+            memory_valid = memory_valid.unsqueeze(0)
+            if memory_reliability is not None and memory_reliability.dim() == 2:
+                memory_reliability = memory_reliability.unsqueeze(0)
+        if memory_query_feat.shape[0] != B:
+            raise ValueError(
+                'memory batch size must match query batch size, got '
+                f'{memory_query_feat.shape[0]} and {B}')
+
+        K, M = memory_query_feat.shape[1:3]
+        N = K * M
+        if N == 0:
+            zeros = query_feat.new_zeros(B, Q, C)
+            return zeros, self._empty_diagnostics(B, Q, query_feat.device)
+
+        mem_feat = memory_query_feat.reshape(B, N, C).to(query_feat.device)
+        mem_points = memory_points_metric.reshape(
+            B, N, memory_points_metric.shape[-2], 3).to(query_feat.device)
+        mem_conf = memory_conf.reshape(B, N).to(query_feat.device).float()
+        mem_age = memory_age.reshape(B, N).to(query_feat.device).float()
+        mem_valid = memory_valid.reshape(B, N).to(query_feat.device).bool()
+        if memory_reliability is None:
+            mem_reliability = mem_conf
+        else:
+            mem_reliability = memory_reliability.reshape(
+                B, N).to(query_feat.device).float()
+
+        q = self._project_heads(self.q_proj, query_feat, Q)
+        k = self._project_heads(self.k_proj, mem_feat, N)
+        v = self._project_heads(self.v_proj, mem_feat, N)
+
+        semantic = torch.matmul(q, k.transpose(-1, -2))
+        semantic = semantic / math.sqrt(float(self.head_dim))
+
+        q_center = query_points_metric.to(query_feat.device).float().mean(dim=-2)
+        m_center = mem_points.float().mean(dim=-2)
+        dist_sq = ((q_center[:, :, None] - m_center[:, None])**2).sum(dim=-1)
+        dist = torch.sqrt(dist_sq.clamp_min(0.0))
+
+        # effective-age causal + max-age filter (mem_age is effective age)
+        age_valid = (mem_age > 0.0) & (mem_age <= self.max_age)
+        reliability_valid = torch.isfinite(mem_reliability) & (
+            mem_reliability > 0.0)
+        base_valid = mem_valid & age_valid & reliability_valid
+        spatial_valid = dist <= self.spatial_radius
+        candidate = base_valid[:, None, :] & spatial_valid
+
+        lambda_position = F.softplus(self.raw_lambda_position).view(
+            1, self.num_heads, 1, 1)
+        lambda_time = F.softplus(self.raw_lambda_time).view(
+            1, self.num_heads, 1, 1)
+        lambda_reliability = F.softplus(self.raw_lambda_reliability).view(
+            1, self.num_heads, 1, 1)
+        radius_norm = self.spatial_radius**2 + _EPS
+        age_norm = self.max_age + _EPS
+        scores = semantic
+        scores = scores - lambda_position * dist_sq[:, None] / radius_norm
+        scores = scores - lambda_time * mem_age[:, None, None] / age_norm
+        scores = scores + lambda_reliability * torch.log(
+            mem_reliability.clamp_min(_EPS))[:, None, None]
+
+        topk = min(self.topk, N)
+        expanded_candidate = candidate[:, None].expand(
+            B, self.num_heads, Q, N)
+        topk_scores, topk_indices = torch.topk(
+            scores.masked_fill(~expanded_candidate, torch.finfo(scores.dtype).min),
+            k=topk,
+            dim=-1)
+        topk_valid = torch.gather(expanded_candidate, -1, topk_indices)
+        weights = safe_masked_softmax(topk_scores, topk_valid, dim=-1)
+        weights = self.dropout(weights)
+
+        gather_index = topk_indices[..., None].expand(
+            B, self.num_heads, Q, topk, self.head_dim)
+        selected_v = torch.gather(
+            v[:, :, None].expand(B, self.num_heads, Q, N, self.head_dim),
+            3,
+            gather_index)
+        read_heads = (weights[..., None] * selected_v).sum(dim=-2)
+        readout = read_heads.permute(0, 2, 1, 3).reshape(B, Q, C)
+        output = self.out_proj(readout.to(self.out_proj.weight.dtype))
+        output = output.to(query_feat.dtype)
+
+        has_candidate_head = topk_valid.any(dim=-1)
+        has_candidate = has_candidate_head.any(dim=1)
+        output = output * has_candidate.unsqueeze(-1).to(output.dtype)
+
+        selected_reliability = torch.gather(
+            mem_reliability[:, None, None].expand(B, self.num_heads, Q, N),
+            -1,
+            topk_indices)
+        selected_dist = torch.gather(
+            dist[:, None].expand(B, self.num_heads, Q, N), -1,
+            topk_indices)
+        selected_age = torch.gather(
+            mem_age[:, None, None].expand(B, self.num_heads, Q, N),
+            -1,
+            topk_indices)
+        support_rel_head = (weights * selected_reliability).sum(dim=-1)
+        avg_dist_head = (weights * selected_dist).sum(dim=-1)
+        avg_age_head = (weights * selected_age).sum(dim=-1)
+        head_den = has_candidate_head.float().sum(dim=1).clamp_min(1.0)
+        support_reliability = (
+            support_rel_head * has_candidate_head.float()).sum(dim=1) / head_den
+        avg_dist = (
+            avg_dist_head * has_candidate_head.float()).sum(dim=1) / head_den
+        avg_age = (
+            avg_age_head * has_candidate_head.float()).sum(dim=1) / head_den
+        diagnostics = dict(
+            has_candidate=has_candidate,
+            # support_conf kept as an alias for the fusion gate / legacy logs
+            support_conf=support_reliability,
+            support_reliability=support_reliability,
+            candidate_count=candidate.sum(dim=-1).detach(),
+            topk_candidate_count=topk_valid.sum(dim=-1).max(dim=1).values.detach(),
+            avg_distance=avg_dist.detach(),
+            avg_age=avg_age.detach(),
+            effective_age=avg_age.detach(),
+            attention_shape=(B, self.num_heads, Q, topk))
+        return output, diagnostics
+
+    def _empty_diagnostics(self, B, Q, device):
+        return dict(
+            has_candidate=torch.zeros(B, Q, device=device, dtype=torch.bool),
+            support_conf=torch.zeros(B, Q, device=device),
+            support_reliability=torch.zeros(B, Q, device=device),
+            candidate_count=torch.zeros(B, Q, device=device, dtype=torch.long),
+            topk_candidate_count=torch.zeros(B, Q, device=device, dtype=torch.long),
+            avg_distance=torch.zeros(B, Q, device=device),
+            avg_age=torch.zeros(B, Q, device=device),
+            effective_age=torch.zeros(B, Q, device=device),
+            attention_shape=(B, self.num_heads, Q, 0))
+
+
+class ConfidenceGatedFusion(nn.Module):
+    """Confidence-gated residual query fusion with LayerScale.
+
+    ``alpha_init=0`` is retained as an explicit strict-identity option for
+    legacy STAC-QM modes.  Phase 3 uses a small nonzero alpha so the first
+    backward pass reaches attention, gate, and projection parameters.
+    """
+
+    def __init__(self,
+                 embed_dims=256,
+                 ffn_dims=512,
+                 gate_bias=-4.0,
+                 alpha_init=0.0,
+                 out_proj_gain=0.0):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(embed_dims)
+        self.norm_h = nn.LayerNorm(embed_dims)
+        self.norm_delta = nn.LayerNorm(embed_dims)
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(embed_dims * 3 + 2, ffn_dims),
+            nn.ReLU(inplace=True),
+            nn.Linear(ffn_dims, embed_dims),
+        )
+        self.out_proj = nn.Linear(embed_dims, embed_dims)
+        if float(out_proj_gain) == 0.0:
+            nn.init.zeros_(self.out_proj.weight)
+        else:
+            nn.init.xavier_uniform_(self.out_proj.weight,
+                                    gain=float(out_proj_gain))
+        nn.init.zeros_(self.out_proj.bias)
+        nn.init.constant_(self.gate_mlp[-1].bias, float(gate_bias))
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+
+    @property
+    def memory_norm(self):
+        """Named alias used by the Phase 3 fusion specification."""
+        return self.norm_h
+
+    def forward(self,
+                query_feat,
+                memory_output,
+                current_confidence,
+                support_confidence,
+                has_candidate):
+        orig_dtype = query_feat.dtype
+        if current_confidence.dim() == 2:
+            current_confidence = current_confidence.unsqueeze(-1)
+        if support_confidence.dim() == 2:
+            support_confidence = support_confidence.unsqueeze(-1)
+        has = has_candidate.to(device=query_feat.device).bool()
+        h = memory_output.to(query_feat.device)
+        gate_input = torch.cat([
+            self.norm_q(query_feat.float()),
+            self.memory_norm(h.float()),
+            self.norm_delta((query_feat - h).float()),
+            current_confidence.to(query_feat.device).float(),
+            support_confidence.to(query_feat.device).float(),
+        ], dim=-1)
+        gate = torch.sigmoid(self.gate_mlp(gate_input))
+        residual = self.out_proj(h.to(self.out_proj.weight.dtype)).to(orig_dtype)
+        applied_residual = (
+            has.unsqueeze(-1).to(orig_dtype) * self.alpha.to(orig_dtype) *
+            gate.to(orig_dtype) * residual)
+        fused = query_feat + applied_residual
+        has_float = has.float()
+        candidate_count = has_float.sum().clamp_min(1.0)
+        conditional_gate = (
+            (gate.detach().float().mean(dim=-1) * has_float).sum() /
+            candidate_count)
+        residual_ratio = applied_residual.detach().float().norm(dim=-1) / (
+            query_feat.detach().float().norm(dim=-1) + 1e-6)
+        diagnostics = dict(
+            avg_gate=(
+                gate.detach() * has.unsqueeze(-1).float()).mean(dim=-1),
+            conditional_gate=conditional_gate.detach(),
+            candidate_ratio=has_float.mean().detach(),
+            residual_norm=applied_residual.detach().float().norm(dim=-1),
+            residual_ratio=residual_ratio.detach(),
+            fusion_alpha=self.alpha.detach().clone())
+        return fused, diagnostics
+
+
+class STACQueryMemory(nn.Module):
+    """STAC-QM wrapper: align memory, read it, then gate-fuse residuals."""
+
+    def __init__(self,
+                 enabled=True,
+                 embed_dims=256,
+                 num_heads=8,
+                 spatial_radius=12.0,
+                 topk=32,
+                 max_age=3.0,
+                 lambda_position=1.0,
+                 lambda_time=1.0,
+                 lambda_reliability=None,
+                 lambda_confidence=1.0,
+                 dropout=0.0,
+                 motion_compensation=True,
+                 max_velocity=20.0,
+                 pc_range=None,
+                 fusion_gate_bias=-4.0,
+                 fusion_alpha_init=0.0,
+                 fusion_out_proj_gain=0.0,
+                 **kwargs):
+        super().__init__()
+        del kwargs
+        self.enabled = bool(enabled)
+        self.motion_compensation = bool(motion_compensation)
+        self.max_velocity = float(max_velocity)
+        if pc_range is None:
+            pc_range = [-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]
+        self.aligner = EgoPoseAligner(pc_range)
+        self.attention = CausalQueryMemoryAttention(
+            embed_dims=embed_dims,
+            num_heads=num_heads,
+            dropout=dropout,
+            lambda_position=lambda_position,
+            lambda_time=lambda_time,
+            lambda_reliability=lambda_reliability,
+            lambda_confidence=lambda_confidence,
+            spatial_radius=spatial_radius,
+            topk=topk,
+            max_age=max_age,
+            pc_range=pc_range)
+        self.fusion = ConfidenceGatedFusion(
+            embed_dims=embed_dims,
+            ffn_dims=embed_dims * 2,
+            gate_bias=fusion_gate_bias,
+            alpha_init=fusion_alpha_init,
+            out_proj_gain=fusion_out_proj_gain)
+        # zero-initialized -> exact ego-only alignment until trained
+        self.motion_compensator = QueryMotionCompensator(
+            embed_dims=embed_dims, max_velocity=max_velocity, max_age=max_age)
+
+    def forward(self,
+                query_feat,
+                query_points_metric,
+                current_confidence,
+                memory=None,
+                target_ego2global=None,
+                future_offset=0.0,
+                **memory_kwargs):
+        if not self.enabled:
+            return query_feat, dict(enabled=False)
+        if memory is None:
+            memory = memory_kwargs
+        if not memory:
+            identity = self._training_identity(query_feat)
+            return identity, self._identity_diagnostics(query_feat)
+        memory_query_feat = memory.get('memory_query_feat')
+        memory_points_metric = memory.get('memory_points_metric')
+        memory_conf = memory.get('memory_conf')
+        memory_valid = memory.get('memory_valid')
+        memory_age = memory.get('memory_age')
+        memory_reliability = memory.get('memory_reliability')
+        source_ego = memory.get('memory_source_ego2global')
+        required = [
+            memory_query_feat, memory_points_metric, memory_conf, memory_valid,
+            memory_age
+        ]
+        if any(x is None for x in required):
+            raise KeyError(
+                'STAC-QM memory requires memory_query_feat, '
+                'memory_points_metric, memory_conf, memory_valid, and '
+                'memory_age')
+        if memory_valid.numel() == 0 or not memory_valid.to(
+                query_feat.device).bool().any():
+            identity = self._training_identity(query_feat)
+            return identity, self._identity_diagnostics(query_feat)
+
+        if memory_query_feat.dim() == 3:
+            memory_query_feat = memory_query_feat.unsqueeze(0)
+            memory_points_metric = memory_points_metric.unsqueeze(0)
+            memory_conf = memory_conf.unsqueeze(0)
+            memory_valid = memory_valid.unsqueeze(0)
+            memory_age = memory_age.unsqueeze(0)
+            if memory_reliability is not None and memory_reliability.dim() == 2:
+                memory_reliability = memory_reliability.unsqueeze(0)
+            if source_ego is not None and source_ego.dim() == 3:
+                source_ego = source_ego.unsqueeze(0)
+        if memory_query_feat.shape[0] != query_feat.shape[0]:
+            raise ValueError(
+                'STAC-QM does not share memory across batch samples: '
+                f'query B={query_feat.shape[0]}, memory B='
+                f'{memory_query_feat.shape[0]}')
+        if source_ego is None or target_ego2global is None:
+            raise ValueError(
+                'memory_source_ego2global and target_ego2global are required '
+                'to align valid STAC-QM memory')
+
+        memory_query_feat = memory_query_feat.to(query_feat.device)
+        base_age = memory_age.to(query_feat.device).float()  # [B, K, M]
+        # future-aware age: observation uses future_offset=0, scheduled query
+        # group k uses (k+1) * frame_interval. Cached timestamps are unchanged.
+        effective_age = compute_effective_age(base_age, future_offset)
+
+        # (1) ego-pose alignment: P_{h->t} = G_t^{-1} G_h P_h
+        aligned_points = self.aligner(
+            memory_points_metric.to(query_feat.device),
+            source_ego.to(query_feat.device),
+            target_ego2global.to(query_feat.device))
+
+        # (2) zero-initialized object-motion residual on the ego-aligned points
+        motion_diag = {}
+        if self.motion_compensation:
+            velocity = self.motion_compensator(memory_query_feat, effective_age)
+            # single translation shared by all R points of a query
+            shift = effective_age[..., None, None] * velocity[..., None, :]
+            aligned_points = aligned_points + shift.to(aligned_points.dtype)
+            residual_norm = shift.norm(dim=-1)  # [B, K, M, R]
+            motion_diag = dict(
+                motion_residual_mean=residual_norm.mean().detach(),
+                motion_residual_max=residual_norm.max().detach(),
+                motion_velocity_norm=velocity.norm(dim=-1).mean().detach())
+
+        if memory_reliability is not None:
+            memory_reliability = memory_reliability.to(query_feat.device)
+        memory_output, attn_diag = self.attention(
+            query_feat=query_feat,
+            query_points_metric=query_points_metric,
+            memory_query_feat=memory_query_feat,
+            memory_points_metric=aligned_points,
+            memory_conf=memory_conf.to(query_feat.device),
+            memory_age=effective_age,
+            memory_valid=memory_valid.to(query_feat.device),
+            memory_reliability=memory_reliability)
+        fused, gate_diag = self.fusion(
+            query_feat,
+            memory_output,
+            current_confidence,
+            attn_diag['support_conf'],
+            attn_diag['has_candidate'])
+        diagnostics = dict(attn_diag)
+        diagnostics.update(gate_diag)
+        diagnostics.update(motion_diag)
+        diagnostics['base_age'] = base_age.mean().detach()
+        diagnostics['future_offset'] = float(future_offset)
+        diagnostics['effective_age_mean'] = effective_age.mean().detach()
+        return fused, diagnostics
+
+    def _training_identity(self, query_feat):
+        """Keep empty-memory batches numerically exact but differentiable.
+
+        Scene-boundary samples can have no target-age history. In Memory-only
+        training the base model is frozen, so returning ``query_feat`` directly
+        would produce a loss with no grad_fn and make both smoke and formal
+        optimizer hooks fail. Zero-valued anchors give every trainable STAC-QM
+        parameter an explicit zero gradient without inventing connectivity.
+        """
+        if not self.training:
+            return query_feat
+        zero = query_feat.new_zeros(())
+        has_trainable = False
+        for param in self.parameters():
+            if param.requires_grad and param.numel():
+                zero = zero + param.reshape(-1)[0].to(query_feat.dtype) * 0.0
+                has_trainable = True
+        if not has_trainable:
+            return query_feat
+        return query_feat + zero
+
+    def _identity_diagnostics(self, query_feat):
+        B, Q = query_feat.shape[:2]
+        device = query_feat.device
+        return dict(
+            has_candidate=torch.zeros(B, Q, device=device, dtype=torch.bool),
+            support_conf=torch.zeros(B, Q, device=device),
+            support_reliability=torch.zeros(B, Q, device=device),
+            candidate_count=torch.zeros(B, Q, device=device, dtype=torch.long),
+            topk_candidate_count=torch.zeros(B, Q, device=device, dtype=torch.long),
+            avg_distance=torch.zeros(B, Q, device=device),
+            avg_age=torch.zeros(B, Q, device=device),
+            effective_age=torch.zeros(B, Q, device=device),
+            avg_gate=torch.zeros(B, Q, device=device),
+            residual_norm=torch.zeros(B, Q, device=device),
+            attention_shape=(B, self.attention.num_heads, Q, 0))
+
+
+class FutureMemoryAdapter(nn.Module):
+    """Independent residual adapter for the 1/2/3 second outputs.
+
+    This module deliberately has no state-stream side effects.  It consumes a
+    baseline query and an aligned fixed-memory context and returns residuals
+    for the *current output only*.  The caller must keep the baseline future
+    recurrence separate from these returned tensors.
+
+    The attention score combines feature similarity, semantic compatibility,
+    relative position, temporal age and memory reliability.  Semantic memory
+    is represented as a probability distribution over the 17 non-empty
+    occupancy classes; a cached label is used as a one-hot fallback when a
+    legacy record does not contain the distribution.
+    """
+
+    def __init__(self,
+                 embed_dims=256,
+                 num_classes=17,
+                 num_points=48,
+                 num_heads=8,
+                 horizon_count=3,
+                 topk=16,
+                 spatial_radius=12.0,
+                 max_age=8.0,
+                 dropout=0.0,
+                 gate_bias=-1.0,
+                 pc_range=None):
+        super().__init__()
+        if int(embed_dims) % int(num_heads) != 0:
+            raise ValueError('FutureMemoryAdapter requires embed_dims % num_heads == 0')
+        if int(num_classes) <= 0 or int(num_points) <= 0:
+            raise ValueError('FutureMemoryAdapter requires positive class/point counts')
+        if int(horizon_count) != 3:
+            raise ValueError('FutureMemoryAdapter currently supports 3 target horizons')
+        self.embed_dims = int(embed_dims)
+        self.num_classes = int(num_classes)
+        self.num_points = int(num_points)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.embed_dims // self.num_heads
+        self.horizon_count = int(horizon_count)
+        self.topk = int(topk)
+        self.spatial_radius = float(spatial_radius)
+        self.max_age = float(max_age)
+        self.query_norm = nn.LayerNorm(self.embed_dims)
+        self.memory_norm = nn.LayerNorm(self.embed_dims)
+        self.query_proj = nn.Linear(self.embed_dims, self.embed_dims)
+        self.key_proj = nn.Linear(self.embed_dims, self.embed_dims)
+        self.value_proj = nn.Linear(self.embed_dims, self.embed_dims)
+        self.out_proj = nn.Linear(self.embed_dims, self.embed_dims)
+        self.horizon_embedding = nn.Embedding(self.horizon_count,
+                                              self.embed_dims)
+        self.semantic_query_proj = nn.Linear(self.num_classes, self.embed_dims)
+        self.semantic_memory_proj = nn.Linear(self.num_classes, self.embed_dims)
+        self.adapter = nn.Sequential(
+            nn.Linear(self.embed_dims * 4 + 4, self.embed_dims * 2),
+            nn.LayerNorm(self.embed_dims * 2),
+            nn.GELU(),
+            nn.Linear(self.embed_dims * 2, self.embed_dims),
+            nn.LayerNorm(self.embed_dims),
+            nn.GELU())
+        self.delta_s_head = nn.Sequential(
+            nn.Linear(self.embed_dims, self.embed_dims), nn.GELU(),
+            nn.Linear(self.embed_dims, self.num_points * self.num_classes))
+        self.delta_o_head = nn.Sequential(
+            nn.Linear(self.embed_dims, self.embed_dims), nn.GELU(),
+            nn.Linear(self.embed_dims, self.num_points))
+        self.delta_p_head = nn.Sequential(
+            nn.Linear(self.embed_dims, self.embed_dims), nn.GELU(),
+            nn.Linear(self.embed_dims, self.num_points * 3))
+        self.gate_head = nn.Linear(self.embed_dims, 1)
+        self.dropout = nn.Dropout(float(dropout))
+        if pc_range is None:
+            pc_range = [-40.0, -40.0, -1.0, 40.0, 40.0, 5.4]
+        self.register_buffer('pc_range', torch.as_tensor(pc_range,
+                                                          dtype=torch.float32))
+        self.aligner = EgoPoseAligner(pc_range)
+
+        # Standard non-zero projections preserve a live second-step gradient
+        # path.  Only residual-head last layers are zero so the initial output
+        # is exactly the baseline.  There is intentionally no tiny global
+        # alpha (the old Phase3 ``1e-3`` scale is not used here).
+        for layer in (self.query_proj, self.key_proj, self.value_proj,
+                      self.out_proj, self.semantic_query_proj,
+                      self.semantic_memory_proj):
+            nn.init.xavier_uniform_(layer.weight)
+            nn.init.zeros_(layer.bias)
+        nn.init.normal_(self.horizon_embedding.weight, mean=0.0, std=0.02)
+        for head in (self.delta_s_head, self.delta_o_head, self.delta_p_head):
+            nn.init.xavier_uniform_(head[0].weight)
+            nn.init.zeros_(head[0].bias)
+            nn.init.zeros_(head[-1].weight)
+            nn.init.zeros_(head[-1].bias)
+        nn.init.xavier_uniform_(self.gate_head.weight)
+        nn.init.constant_(self.gate_head.bias, float(gate_bias))
+
+    def _check_query(self, query_feat, query_points, baseline_logits):
+        if query_feat.dim() != 3:
+            raise ValueError('baseline query feature must be [B, Q, C]')
+        if query_feat.shape[-1] != self.embed_dims:
+            raise ValueError('baseline query feature has an unexpected channel dimension')
+        if query_points.dim() != 4 or query_points.shape[:2] != query_feat.shape[:2] \
+                or query_points.shape[-1] != 3:
+            raise ValueError('baseline query points must be [B, Q, R, 3]')
+        if query_points.shape[-2] != self.num_points:
+            raise ValueError(
+                f'baseline query points use R={query_points.shape[-2]}, '
+                f'but adapter was configured for num_points={self.num_points}')
+        if baseline_logits.dim() != 4 or \
+                baseline_logits.shape[:3] != query_points.shape[:3] or \
+                baseline_logits.shape[-1] != self.num_classes:
+            raise ValueError(
+                'baseline absolute logits must be [B, Q, R, num_classes] '
+                f'with num_classes={self.num_classes}')
+
+    def _memory_semantics(self, memory, B, N, device, dtype):
+        dist = memory.get('memory_semantic_distribution')
+        labels = memory.get('memory_label')
+        if dist is None:
+            if labels is None:
+                raise KeyError(
+                    'FutureMemoryAdapter requires memory_semantic_distribution '
+                    'or memory_label')
+            labels = labels.to(device=device).long().reshape(B, N)
+            if ((labels >= self.num_classes) | (labels < -1)).any():
+                raise ValueError('memory_label contains an invalid class index')
+            dist = torch.zeros(B, N, self.num_classes, device=device,
+                               dtype=dtype)
+            valid_label = labels >= 0
+            if valid_label.any():
+                dist[valid_label] = F.one_hot(
+                    labels[valid_label], self.num_classes).to(dtype)
+            # Unknown schema-v1 labels use an uninformative, valid prior.
+            unknown = ~valid_label
+            if unknown.any():
+                dist[unknown] = 1.0 / float(self.num_classes)
+        else:
+            dist = dist.to(device=device, dtype=dtype)
+            if dist.numel() != B * N * self.num_classes:
+                raise ValueError(
+                    'memory_semantic_distribution must have shape '
+                    f'[B,K,M,{self.num_classes}] (flattened size '
+                    f'{B * N * self.num_classes}), got {tuple(dist.shape)}')
+            dist = dist.reshape(B, N, self.num_classes)
+            if not torch.isfinite(dist).all():
+                raise ValueError('memory_semantic_distribution must be finite')
+            if (dist < 0).any():
+                raise ValueError('memory_semantic_distribution must be non-negative')
+            dist = dist / dist.sum(dim=-1, keepdim=True).clamp_min(_EPS)
+            if labels is not None:
+                labels = labels.to(device=device).long().reshape(B, N)
+                if ((labels >= self.num_classes) | (labels < -1)).any():
+                    raise ValueError('memory_label contains an invalid class index')
+                # A valid cached label is also a light semantic prior.  This
+                # keeps the label functionally causal even when a soft
+                # distribution is present, while retaining the cache's richer
+                # distribution as the dominant signal.
+                valid_label = labels >= 0
+                if valid_label.any():
+                    one_hot = F.one_hot(
+                        labels.clamp_min(0), self.num_classes).to(dtype)
+                    prior = valid_label.unsqueeze(-1).to(dtype) * one_hot
+                    dist = (0.9 * dist + 0.1 * prior)
+                    dist = dist / dist.sum(dim=-1, keepdim=True).clamp_min(_EPS)
+        return dist
+
+    def _reshape_memory(self, memory, B, device, dtype):
+        required = ('memory_query_feat', 'memory_points_metric', 'memory_valid',
+                    'memory_reliability', 'memory_age')
+        missing = [key for key in required if memory.get(key) is None]
+        if missing:
+            raise KeyError('FutureMemoryAdapter memory is missing: ' +
+                           ', '.join(missing))
+        feat = memory['memory_query_feat'].to(device=device, dtype=dtype)
+        points = memory['memory_points_metric'].to(device=device, dtype=dtype)
+        valid = memory['memory_valid'].to(device=device).bool()
+        reliability = memory['memory_reliability'].to(device=device,
+                                                        dtype=torch.float32)
+        age = memory['memory_age'].to(device=device, dtype=torch.float32)
+        # Normalize the common unbatched cache form without mutating the
+        # caller-owned dictionary (the same context is reused at 1/2/3 s).
+        semantic_value = memory.get('memory_semantic_distribution')
+        label_value = memory.get('memory_label')
+        if feat.dim() == 3:
+            feat = feat.unsqueeze(0)
+            points = points.unsqueeze(0)
+            valid = valid.unsqueeze(0)
+            reliability = reliability.unsqueeze(0)
+            age = age.unsqueeze(0)
+            if label_value is not None and label_value.dim() in (1, 2):
+                label_value = label_value.unsqueeze(0)
+            if semantic_value is not None and semantic_value.dim() in (2, 3):
+                semantic_value = semantic_value.unsqueeze(0)
+        if feat.dim() != 4 or feat.shape[0] != B:
+            raise ValueError('memory_query_feat must be [B, K, M, C]')
+        if feat.shape[-1] != self.embed_dims:
+            raise ValueError('memory feature channel dimension mismatch')
+        if points.dim() != 5 or points.shape[:3] != feat.shape[:3] \
+                or points.shape[-1] != 3:
+            raise ValueError('memory_points_metric must be [B, K, M, R, 3]')
+        expected_memory_shape = feat.shape[:3]
+        if label_value is not None and label_value.shape != expected_memory_shape:
+            raise ValueError(
+                'memory_label must be [B, K, M] matching memory features, '
+                f'got {tuple(label_value.shape)}')
+        if semantic_value is not None and (
+                semantic_value.dim() != 4 or
+                semantic_value.shape[:3] != expected_memory_shape or
+                semantic_value.shape[-1] != self.num_classes):
+            raise ValueError(
+                'memory_semantic_distribution must be [B, K, M, '
+                f'{self.num_classes}] matching memory features, got '
+                f'{tuple(semantic_value.shape)}')
+        if valid.shape != feat.shape[:3] or reliability.shape != feat.shape[:3] \
+                or age.shape != feat.shape[:3]:
+            raise ValueError('memory feature/validity/reliability/age shapes mismatch')
+        K, M = feat.shape[1:3]
+        N = K * M
+        flat = dict(
+            feat=feat.reshape(B, N, self.embed_dims),
+            points=points.reshape(B, N, points.shape[-2], 3),
+            valid=valid.reshape(B, N),
+            reliability=reliability.reshape(B, N),
+            age=age.reshape(B, N))
+        semantic_memory = dict(memory)
+        if label_value is not None:
+            semantic_memory['memory_label'] = label_value
+        if semantic_value is not None:
+            semantic_memory['memory_semantic_distribution'] = semantic_value
+        flat['semantic'] = self._memory_semantics(semantic_memory, B, N, device,
+                                                  dtype)
+        return flat
+
+    def _empty_result(self, query_feat, horizon_id):
+        B, Q, _ = query_feat.shape
+        zeros_s = query_feat.new_zeros(B, Q, self.num_points, self.num_classes)
+        zeros_o = query_feat.new_zeros(B, Q, self.num_points, 1)
+        zeros_p = query_feat.new_zeros(B, Q, self.num_points, 3)
+        zeros_g = query_feat.new_zeros(B, Q, 1)
+        return dict(delta_s=zeros_s, delta_o=zeros_o, delta_p=zeros_p,
+                    gate=zeros_g, context=query_feat.new_zeros(B, Q, self.embed_dims),
+                    attention_query=query_feat.new_zeros(B, Q, self.embed_dims),
+                    diagnostics=dict(has_candidate=torch.zeros(
+                        B, Q, dtype=torch.bool, device=query_feat.device),
+                        candidate_count=torch.zeros(B, Q, dtype=torch.long,
+                                                     device=query_feat.device),
+                        horizon_id=int(horizon_id)))
+
+    def forward(self,
+                query_feat,
+                query_points_metric,
+                baseline_logits,
+                memory,
+                horizon_id,
+                target_ego2global=None):
+        """Return independent semantic/occupancy/position residuals.
+
+        ``horizon_id`` is 0, 1, or 2 for 1s, 2s, or 3s.  The embedding is
+        added to the projected query before attention scores are computed.
+        """
+        self._check_query(query_feat, query_points_metric, baseline_logits)
+        if int(horizon_id) not in range(self.horizon_count):
+            raise ValueError(f'horizon_id must be in [0, {self.horizon_count})')
+        if memory is None:
+            return self._empty_result(query_feat, horizon_id)
+        B, Q, _ = query_feat.shape
+        # Cache points are stored in their source ego frame.  Align them to
+        # the current query frame before distance/support computation.  The
+        # optional argument keeps the adapter easy to exercise with synthetic
+        # already-aligned memory in unit tests.
+        memory_for_read = dict(memory)
+        source_ego = memory_for_read.get('memory_source_ego2global')
+        if source_ego is not None and target_ego2global is not None:
+            raw_points = memory_for_read['memory_points_metric'].to(
+                device=query_feat.device, dtype=query_feat.dtype)
+            source_ego = source_ego.to(device=query_feat.device,
+                                       dtype=torch.float32)
+            target_ego2global = target_ego2global.to(
+                device=query_feat.device, dtype=torch.float32)
+            if raw_points.dim() == 4:
+                raw_points = raw_points.unsqueeze(0)
+            memory_for_read['memory_points_metric'] = self.aligner(
+                raw_points, source_ego, target_ego2global)
+            # The points are now in the target frame; do not attempt a second
+            # alignment after the K/M flattening step.
+            memory_for_read.pop('memory_source_ego2global', None)
+        flat = self._reshape_memory(memory_for_read, B, query_feat.device,
+                                    query_feat.dtype)
+        N = flat['feat'].shape[1]
+        if N == 0:
+            return self._empty_result(query_feat, horizon_id)
+        current_sem = F.softmax(baseline_logits.float(), dim=-1).mean(dim=-2)
+        current_sem = current_sem / current_sem.sum(dim=-1, keepdim=True).clamp_min(_EPS)
+        horizon = self.horizon_embedding.weight[int(horizon_id)].to(
+            device=query_feat.device, dtype=query_feat.dtype).view(1, 1, -1)
+        horizon = horizon.expand(B, Q, -1)
+        q_input = self.query_norm(query_feat) + horizon + self.semantic_query_proj(
+            current_sem.to(self.semantic_query_proj.weight.dtype)).to(query_feat.dtype)
+        q = self.query_proj(q_input).float().view(
+            B, Q, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.key_proj(self.memory_norm(flat['feat'])).float().view(
+            B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        memory_value = self.value_proj(self.memory_norm(flat['feat'])) + \
+            self.semantic_memory_proj(flat['semantic'].to(
+                self.semantic_memory_proj.weight.dtype)).to(query_feat.dtype)
+        v = memory_value.float().view(
+            B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        feature_score = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(
+            float(self.head_dim))
+        semantic_compat = torch.einsum(
+            'bqc,bnc->bqn', current_sem, flat['semantic']).clamp_min(_EPS)
+        semantic_score = torch.log(semantic_compat).unsqueeze(1)
+        q_center = query_points_metric.float().mean(dim=-2)
+        m_center = flat['points'].float().mean(dim=-2)
+        distance = torch.sqrt(((q_center[:, :, None] - m_center[:, None]) ** 2).sum(-1).clamp_min(0.0))
+        memory_valid = flat['valid'] & torch.isfinite(flat['reliability']) \
+            & (flat['reliability'] > 0) & torch.isfinite(flat['age']) \
+            & (flat['age'] > 0) & (flat['age'] <= self.max_age)
+        candidate = memory_valid[:, None, :] & (distance <= self.spatial_radius)
+        score = feature_score + semantic_score
+        score = score - distance[:, None] ** 2 / (self.spatial_radius ** 2 + _EPS)
+        score = score - flat['age'][:, None, None] / (self.max_age + _EPS)
+        score = score + torch.log(flat['reliability'].clamp_min(_EPS))[:, None, None]
+        topk = min(self.topk, N)
+        expanded = candidate[:, None].expand(B, self.num_heads, Q, N)
+        top_scores, top_idx = torch.topk(
+            score.masked_fill(~expanded, torch.finfo(score.dtype).min),
+            k=topk, dim=-1)
+        top_valid = torch.gather(expanded, -1, top_idx)
+        weights = self.dropout(safe_masked_softmax(top_scores, top_valid, dim=-1))
+        gather = top_idx[..., None].expand(B, self.num_heads, Q, topk,
+                                            self.head_dim)
+        selected = torch.gather(v[:, :, None].expand(
+            B, self.num_heads, Q, N, self.head_dim), 3, gather)
+        context = (weights[..., None] * selected).sum(dim=-2).permute(
+            0, 2, 1, 3).reshape(B, Q, self.embed_dims)
+        context = self.out_proj(context.to(self.out_proj.weight.dtype)).to(query_feat.dtype)
+        has_candidate = top_valid.any(dim=-1).any(dim=1)
+        context = context * has_candidate.unsqueeze(-1).to(context.dtype)
+        selected_rel = torch.gather(flat['reliability'][:, None, None].expand(
+            B, self.num_heads, Q, N), -1, top_idx)
+        selected_age = torch.gather(flat['age'][:, None, None].expand(
+            B, self.num_heads, Q, N), -1, top_idx)
+        selected_dist = torch.gather(distance[:, None].expand(
+            B, self.num_heads, Q, N), -1, top_idx)
+        den = top_valid.float().sum(dim=-1).clamp_min(1.0)
+        support_rel = (weights * selected_rel).sum(-1) / den
+        support_age = (weights * selected_age).sum(-1) / den
+        support_dist = (weights * selected_dist).sum(-1) / den
+        any_head = top_valid.any(dim=-1)
+        head_den = any_head.float().sum(dim=1).clamp_min(1.0)
+        support_rel = (support_rel * any_head.float()).sum(dim=1) / head_den
+        support_age = (support_age * any_head.float()).sum(dim=1) / head_den
+        support_dist = (support_dist * any_head.float()).sum(dim=1) / head_den
+        diagnostics = dict(
+            has_candidate=has_candidate,
+            candidate_count=candidate.sum(dim=-1),
+            support_reliability=support_rel.detach(),
+            average_age=support_age.detach(),
+            average_distance=support_dist.detach(),
+            horizon_id=int(horizon_id),
+            attention_query=q_input,
+            attention_scores=score.detach())
+        diag_features = torch.stack([
+            candidate.sum(dim=-1).float() / float(max(N, 1)),
+            support_rel,
+            (support_age / (self.max_age + _EPS)).clamp(0, 1),
+            (support_dist / (self.spatial_radius + _EPS)).clamp(0, 1)], dim=-1)
+        adapter_input = torch.cat([
+            query_feat, context, query_feat - context, horizon, diag_features],
+            dim=-1)
+        adapted = self.adapter(adapter_input)
+        delta_s = self.delta_s_head(adapted).reshape(
+            B, Q, self.num_points, self.num_classes)
+        delta_o = self.delta_o_head(adapted).reshape(
+            B, Q, self.num_points, 1)
+        delta_p = self.delta_p_head(adapted).reshape(B, Q, self.num_points, 3)
+        gate = torch.sigmoid(self.gate_head(adapted)) * has_candidate.unsqueeze(-1).to(adapted.dtype)
+        diagnostics['attention_query'] = q_input
+        diagnostics['memory_context'] = context
+        return dict(delta_s=delta_s, delta_o=delta_o, delta_p=delta_p,
+                    gate=gate, context=context,
+                    attention_query=q_input, diagnostics=diagnostics)
+
+
+def decode_semantic_occupancy_logits(base_logits, delta_s, delta_o, gate,
+                                    occupancy_gate=None):
+    """Compose V2 semantic and occupancy residuals for legacy decoding."""
+    if gate.dim() == delta_s.dim() - 1:
+        gate = gate.unsqueeze(-1)
+    s_sem = base_logits + gate * delta_s
+    if occupancy_gate is None:
+        occupancy_gate = gate
+    elif occupancy_gate.dim() == delta_o.dim() - 1:
+        occupancy_gate = occupancy_gate.unsqueeze(-1)
+    occupancy = base_logits.max(dim=-1, keepdim=True).values + occupancy_gate * delta_o
+    s_decode = s_sem + (occupancy - s_sem.max(dim=-1, keepdim=True).values)
+    return s_sem, occupancy, s_decode
+
+
+class FutureMemoryAdapterV2(nn.Module):
+    """Two-stage geometry/semantic Query-to-Point future memory adapter.
+
+    The original :class:`FutureMemoryAdapter` is intentionally retained for
+    V1 checkpoint compatibility.  This class is output-only and consumes a
+    baseline snapshot; its point-level residuals are never fed to recurrence.
+    """
+
+    HORIZON_SECONDS = (1.0, 2.0, 3.0)
+
+    def __init__(self, embed_dims=256, num_classes=17, num_points=48,
+                 num_heads=8, coarse_topk_geometry=8,
+                 coarse_topk_semantic=8, point_topk=8, coarse_radius=6.0,
+                 point_radius=6.0, max_effective_age=8.0,
+                 semantic_uncertainty_gamma=2.0, semantic_weight_floor=0.1,
+                 semantic_dropout_probability=0.0, query_chunk_size=64,
+                 coarse_geometry_context_weight=0.5,
+                 point_geometry_head_fraction=0.5,
+                 gate_bias=-1.0, dropout=0.0, pc_range=None,
+                 voxel_size=(0.4, 0.4, 0.4), gate_mode='shared',
+                 horizon_gate_bias=False, **kwargs):
+        super().__init__()
+        del kwargs
+        if int(embed_dims) % int(num_heads) != 0:
+            raise ValueError('FutureMemoryAdapterV2 requires embed_dims % num_heads == 0')
+        self.embed_dims = int(embed_dims)
+        if gate_mode not in ('shared', 'task_split'):
+            raise ValueError('gate_mode must be shared or task_split')
+        if horizon_gate_bias and gate_mode != 'task_split':
+            raise ValueError('horizon_gate_bias requires task_split')
+        self.gate_mode = gate_mode
+        self.use_horizon_gate_bias = bool(horizon_gate_bias)
+        self.num_classes = int(num_classes)
+        self.num_points = int(num_points)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.embed_dims // self.num_heads
+        self.coarse_topk_geometry = max(int(coarse_topk_geometry), 1)
+        self.coarse_topk_semantic = max(int(coarse_topk_semantic), 1)
+        self.point_topk = max(int(point_topk), 1)
+        self.coarse_radius = float(coarse_radius)
+        self.point_radius = float(point_radius)
+        self.max_effective_age = float(max_effective_age)
+        self.semantic_uncertainty_gamma = float(semantic_uncertainty_gamma)
+        self.semantic_weight_floor = float(semantic_weight_floor)
+        self.semantic_dropout_probability = float(semantic_dropout_probability)
+        self.query_chunk_size = max(int(query_chunk_size), 1)
+        self.coarse_geometry_context_weight = float(
+            coarse_geometry_context_weight)
+        if not 0. < self.coarse_geometry_context_weight <= 1.:
+            raise ValueError(
+                'coarse_geometry_context_weight must be in (0, 1]')
+        self.point_geometry_head_fraction = float(
+            point_geometry_head_fraction)
+        if not 0. < self.point_geometry_head_fraction <= 1.:
+            raise ValueError(
+                'point_geometry_head_fraction must be in (0, 1]')
+        # At least one complete attention head is always independent of
+        # explicit current/history semantics. Remaining heads form the
+        # semantic-enhanced point read.
+        self.num_geometry_heads = max(
+            1, min(
+                self.num_heads,
+                int(math.ceil(
+                    self.num_heads * self.point_geometry_head_fraction))))
+        self.voxel_size = tuple(float(x) for x in voxel_size)
+        if pc_range is None:
+            pc_range = [-40., -40., -1., 40., 40., 5.4]
+        self.register_buffer('pc_range', torch.as_tensor(pc_range, dtype=torch.float32))
+        self.aligner = EgoPoseAligner(pc_range)
+        self.query_norm = nn.LayerNorm(self.embed_dims)
+        self.memory_norm = nn.LayerNorm(self.embed_dims)
+        self.query_proj = nn.Linear(self.embed_dims, self.embed_dims)
+        self.key_proj = nn.Linear(self.embed_dims, self.embed_dims)
+        self.value_proj = nn.Linear(self.embed_dims, self.embed_dims)
+        self.out_proj = nn.Linear(self.embed_dims, self.embed_dims)
+        self.point_query_proj = nn.Linear(self.embed_dims, self.embed_dims)
+        self.point_key_proj = nn.Linear(self.embed_dims, self.embed_dims)
+        self.point_value_proj = nn.Linear(self.embed_dims, self.embed_dims)
+        self.current_point_pos = nn.Sequential(
+            nn.Linear(3, self.embed_dims), nn.LayerNorm(self.embed_dims), nn.GELU())
+        self.memory_point_pos = nn.Sequential(
+            nn.Linear(3, self.embed_dims), nn.LayerNorm(self.embed_dims), nn.GELU())
+        self.horizon_embedding = nn.Embedding(3, self.embed_dims)
+        self.semantic_query_proj = nn.Linear(self.num_classes, self.embed_dims)
+        self.semantic_memory_proj = nn.Linear(self.num_classes, self.embed_dims)
+        # Five C-dimensional state features, three num_classes semantic
+        # vectors (P_current, P_memory, and their difference), and ten scalar
+        # diagnostics. Deriving this width here prevents configuration changes
+        # from silently desynchronising the adapter.
+        self.adapter_scalar_dims = 10
+        self.adapter_input_dims = (
+            self.embed_dims * 5 + self.num_classes * 3 +
+            self.adapter_scalar_dims)
+        self.adapter = nn.Sequential(
+            nn.Linear(self.adapter_input_dims, self.embed_dims * 2),
+            nn.LayerNorm(self.embed_dims * 2), nn.GELU(),
+            nn.Linear(self.embed_dims * 2, self.embed_dims),
+            nn.LayerNorm(self.embed_dims), nn.GELU())
+        self.delta_s_head = nn.Sequential(
+            nn.Linear(self.embed_dims, self.embed_dims), nn.GELU(),
+            nn.Linear(self.embed_dims, self.num_classes))
+        self.delta_o_head = nn.Sequential(
+            nn.Linear(self.embed_dims, self.embed_dims), nn.GELU(),
+            nn.Linear(self.embed_dims, 1))
+        self.delta_p_head = nn.Sequential(
+            nn.Linear(self.embed_dims, self.embed_dims), nn.GELU(),
+            nn.Linear(self.embed_dims, 3))
+        self.gate_head = nn.Linear(self.embed_dims, 1)
+        self.dropout = nn.Dropout(float(dropout))
+        self._init_parameters(gate_bias)
+
+        # Keep gate_head as the semantic head so shared-mode checkpoint keys
+        # and initialisation remain unchanged. A adds two independent heads.
+        if self.gate_mode == 'task_split':
+            self.gate_occ_head = nn.Linear(self.embed_dims, 1)
+            self.gate_pos_head = nn.Linear(self.embed_dims, 1)
+            self.gate_occ_head.load_state_dict(self.gate_head.state_dict())
+            self.gate_pos_head.load_state_dict(self.gate_head.state_dict())
+        if self.use_horizon_gate_bias:
+            # [horizon, task], task order = semantic, occupancy, position.
+            self.task_horizon_bias = nn.Parameter(
+                torch.zeros(len(self.HORIZON_SECONDS), 3))
+    def task_gates(self, adapted, horizon_id):
+        """Return independent semantic, occupancy and position point gates."""
+        if self.gate_mode == 'shared':
+            gate = torch.sigmoid(self.gate_head(adapted))
+            return gate, gate, gate
+        logits = (self.gate_head(adapted), self.gate_occ_head(adapted),
+                  self.gate_pos_head(adapted))
+        if self.use_horizon_gate_bias:
+            bias = self.task_horizon_bias[horizon_id].to(adapted.dtype)
+            logits = tuple(value + bias[i] for i, value in enumerate(logits))
+        return tuple(torch.sigmoid(value) for value in logits)
+
+    def _init_parameters(self, gate_bias):
+        for layer in (self.query_proj, self.key_proj, self.value_proj,
+                      self.out_proj, self.point_query_proj,
+                      self.point_key_proj, self.point_value_proj,
+                      self.semantic_query_proj, self.semantic_memory_proj):
+            nn.init.xavier_uniform_(layer.weight)
+            nn.init.zeros_(layer.bias)
+        nn.init.normal_(self.horizon_embedding.weight, mean=0., std=.02)
+        for head in (self.delta_s_head, self.delta_o_head, self.delta_p_head):
+            nn.init.xavier_uniform_(head[0].weight)
+            nn.init.zeros_(head[0].bias)
+            nn.init.zeros_(head[-1].weight)
+            nn.init.zeros_(head[-1].bias)
+        nn.init.xavier_uniform_(self.gate_head.weight)
+        nn.init.constant_(self.gate_head.bias, float(gate_bias))
+
+    def _empty(self, query_feat, horizon_id):
+        B, Q, _ = query_feat.shape
+        z = query_feat.new_zeros
+        empty_gate = z(B, Q, self.num_points, 1)
+        if self.gate_mode == 'task_split' and torch.is_grad_enabled():
+            # A completely empty Memory rank must still join DDP reductions.
+            anchor = sum(p.reshape(-1)[0] * 0. for p in self.parameters())
+            empty_gate = empty_gate + anchor
+        return dict(
+            delta_s=z(B, Q, self.num_points, self.num_classes),
+            delta_o=z(B, Q, self.num_points, 1),
+            delta_p=z(B, Q, self.num_points, 3),
+            gate=empty_gate,
+            gate_sem=empty_gate, gate_occ=empty_gate, gate_pos=empty_gate,
+            point_gate=empty_gate,
+            context=z(B, Q, self.num_points, self.embed_dims),
+            point_context=z(B, Q, self.num_points, self.embed_dims),
+            attention_query=z(B, Q, self.num_points, self.embed_dims),
+            diagnostics=dict(
+                has_candidate=torch.zeros(B, Q, self.num_points,
+                                           dtype=torch.bool, device=query_feat.device),
+                eligible_point_count=torch.zeros(
+                    B, Q, self.num_points, dtype=torch.long,
+                    device=query_feat.device),
+                selected_point_count=torch.zeros(
+                    B, Q, self.num_points, dtype=torch.long,
+                    device=query_feat.device),
+                coarse_candidate_count=torch.zeros(B, Q, dtype=torch.long,
+                                                    device=query_feat.device),
+                coarse_context=z(B, Q, self.embed_dims),
+                coarse_geometry_context=z(B, Q, self.embed_dims),
+                coarse_semantic_context=z(B, Q, self.embed_dims),
+                coarse_geometry_weight=z(B, Q),
+                coarse_semantic_weight=z(B, Q),
+                point_semantic_current=z(
+                    B, Q, self.num_points, self.num_classes),
+                point_semantic_memory=z(
+                    B, Q, self.num_points, self.num_classes),
+                semantic_difference=z(
+                    B, Q, self.num_points, self.num_classes),
+                semantic_cosine=z(B, Q, self.num_points),
+                semantic_js_divergence=z(B, Q, self.num_points),
+                geometry_point_weight_mass=z(
+                    B, Q, self.num_points, self.num_geometry_heads),
+                semantic_point_weight_mass=z(
+                    B, Q, self.num_points,
+                    self.num_heads - self.num_geometry_heads),
+                num_geometry_heads=self.num_geometry_heads,
+                base_age=z(B, 0), effective_age=z(B, 0),
+                horizon_seconds=float(self.HORIZON_SECONDS[horizon_id]),
+                point_attention_shape=(B, 0, self.num_points, self.num_heads, 0)))
+
+    def _semantics(self, memory, B, N, device, dtype):
+        sem = memory.get('memory_semantic_distribution')
+        labels = memory.get('memory_label')
+        if sem is None:
+            sem = torch.full((B, N, self.num_classes), 1. / self.num_classes,
+                             device=device, dtype=dtype)
+            if labels is not None:
+                labels = labels.to(device=device).long().reshape(B, N)
+                if ((labels >= self.num_classes) | (labels < -1)).any():
+                    raise ValueError('memory_label contains an invalid class index')
+                valid = labels >= 0
+                if valid.any():
+                    sem[valid] = F.one_hot(labels[valid], self.num_classes).to(dtype)
+        else:
+            sem = sem.to(device=device, dtype=dtype).reshape(B, N, -1)
+            if sem.shape[-1] != self.num_classes or not torch.isfinite(sem).all() or (sem < 0).any():
+                raise ValueError('memory semantic distribution is invalid')
+            sem = sem / sem.sum(-1, keepdim=True).clamp_min(_EPS)
+        if labels is not None:
+            labels = labels.to(device=device).long().reshape(B, N)
+            if ((labels >= self.num_classes) | (labels < -1)).any():
+                raise ValueError('memory_label contains an invalid class index')
+            valid = labels >= 0
+            if valid.any():
+                one_hot = F.one_hot(labels.clamp_min(0), self.num_classes).to(dtype)
+                sem = 0.9 * sem + 0.1 * one_hot * valid.unsqueeze(-1).to(dtype)
+                sem = sem / sem.sum(-1, keepdim=True).clamp_min(_EPS)
+        return sem
+
+    def _reshape_memory(self, memory, B, device, dtype):
+        required = ('memory_query_feat', 'memory_points_metric', 'memory_valid',
+                    'memory_reliability', 'memory_age')
+        missing = [k for k in required if memory.get(k) is None]
+        if missing:
+            raise KeyError('FutureMemoryAdapterV2 memory is missing: ' + ', '.join(missing))
+        feat = memory['memory_query_feat'].to(device=device, dtype=dtype)
+        points = memory['memory_points_metric'].to(device=device, dtype=dtype)
+        valid = memory['memory_valid'].to(device=device).bool()
+        rel = memory['memory_reliability'].to(device=device, dtype=torch.float32)
+        age = memory['memory_age'].to(device=device, dtype=torch.float32)
+        finite_query = torch.isfinite(feat).all(-1)
+        finite_points = torch.isfinite(points).all(-1).all(-1)
+        finite_rel = torch.isfinite(rel)
+        finite_age = torch.isfinite(age)
+        valid = valid & finite_query & finite_points & finite_rel & finite_age
+        feat = torch.nan_to_num(feat, nan=0., posinf=0., neginf=0.)
+        points = torch.nan_to_num(points, nan=0., posinf=0., neginf=0.)
+        rel = torch.nan_to_num(rel, nan=0., posinf=0., neginf=0.)
+        age = torch.nan_to_num(age, nan=0., posinf=0., neginf=0.)
+        sem = memory.get('memory_semantic_distribution')
+        labels = memory.get('memory_label')
+        if feat.dim() == 3:
+            feat, points, valid, rel, age = [x.unsqueeze(0) for x in
+                                              (feat, points, valid, rel, age)]
+            if sem is not None and sem.dim() in (2, 3): sem = sem.unsqueeze(0)
+            if labels is not None and labels.dim() in (1, 2): labels = labels.unsqueeze(0)
+        if feat.dim() != 4 or feat.shape[0] != B or points.dim() != 5 or points.shape[:3] != feat.shape[:3]:
+            raise ValueError('memory tensors must be [B,K,M,C] and [B,K,M,R,3]')
+        if valid.shape != feat.shape[:3] or rel.shape != feat.shape[:3] or age.shape != feat.shape[:3]:
+            raise ValueError('memory feature/validity/reliability/age shapes mismatch')
+        K, M = feat.shape[1:3]
+        N = K * M
+        if sem is not None and (sem.shape[:3] != feat.shape[:3] or sem.shape[-1] != self.num_classes):
+            raise ValueError('memory_semantic_distribution shape mismatch')
+        if labels is not None and labels.shape != feat.shape[:3]:
+            raise ValueError('memory_label shape mismatch')
+        view = dict(memory, memory_semantic_distribution=sem, memory_label=labels)
+        return dict(feat=feat.reshape(B, N, self.embed_dims),
+                    points=points.reshape(B, N, points.shape[-2], 3),
+                    valid=valid.reshape(B, N), rel=rel.reshape(B, N),
+                    base_age=age.reshape(B, N),
+                    semantic=self._semantics(view, B, N, device, dtype))
+
+    def _semantic_features(self, logits):
+        logits = torch.nan_to_num(logits.float(), nan=0., posinf=30., neginf=-30.)
+        probs = F.softmax(logits, -1)
+        entropy = -(probs * torch.log(probs.clamp_min(_EPS))).sum(-1)
+        uncertainty = (entropy / math.log(max(self.num_classes, 2))).clamp(0., 1.)
+        top = torch.topk(probs, min(2, self.num_classes), -1).values
+        margin = top[..., 0] - (top[..., 1] if self.num_classes > 1 else 0.)
+        weight = (1. - uncertainty).pow(self.semantic_uncertainty_gamma)
+        weight = weight.clamp_min(self.semantic_weight_floor)
+        # Semantic Dropout modifies retrieval conditions only. The original
+        # point-level Baseline probabilities remain P_current.
+        retrieval_probs = probs
+        retrieval_weight = weight
+        dropped = torch.zeros_like(weight, dtype=torch.bool)
+        if self.training and self.semantic_dropout_probability > 0:
+            dropped = torch.rand_like(weight) < self.semantic_dropout_probability
+            retrieval_probs = torch.where(
+                dropped.unsqueeze(-1),
+                torch.full_like(probs, 1. / self.num_classes), probs)
+            retrieval_weight = torch.where(
+                dropped, weight.new_full((), self.semantic_weight_floor),
+                weight)
+        return (probs, retrieval_probs, entropy, uncertainty, margin, weight,
+                retrieval_weight, dropped)
+
+    @staticmethod
+    def semantic_disagreement_features(p_current, p_memory, valid):
+        """Build full point-level semantic correction features.
+
+        P_current, P_memory and their difference have shape
+        [B,Q,R,num_classes]. Cosine similarity and JS divergence have shape
+        [B,Q,R]. Disagreement outputs are strict zero where valid is false.
+        """
+        if p_current.shape != p_memory.shape or \
+                valid.shape != p_current.shape[:-1]:
+            raise ValueError(
+                'semantic disagreement expects matching [B,Q,R,C] '
+                'probabilities and a [B,Q,R] valid mask')
+        mask = valid.unsqueeze(-1)
+        memory = torch.where(mask, p_memory, torch.zeros_like(p_memory))
+        difference = torch.where(
+            mask, p_current - memory, torch.zeros_like(p_current))
+        cosine = F.cosine_similarity(
+            p_current, memory, dim=-1, eps=_EPS)
+        midpoint = 0.5 * (p_current + memory)
+        js = 0.5 * (
+            (p_current * (
+                torch.log(p_current.clamp_min(_EPS)) -
+                torch.log(midpoint.clamp_min(_EPS)))).sum(-1) +
+            (memory * (
+                torch.log(memory.clamp_min(_EPS)) -
+                torch.log(midpoint.clamp_min(_EPS)))).sum(-1))
+        cosine = torch.where(valid, cosine, torch.zeros_like(cosine))
+        js = torch.where(valid, js, torch.zeros_like(js))
+        return difference, cosine, js
+
+    @staticmethod
+    def _union(a, av, b, bv):
+        idx = torch.cat([a, b], -1)
+        valid = torch.cat([av, bv], -1)
+        chosen = torch.zeros_like(valid)
+        for j in range(idx.shape[-1]):
+            prior = chosen[..., :j] & (idx[..., :j] == idx[..., j:j + 1])
+            chosen[..., j] = valid[..., j] & ~prior.any(-1)
+        return idx, chosen
+
+    @staticmethod
+    def aggregate_support_statistics(weights, top_valid, selected_rel,
+                                     selected_age, selected_dist):
+        """Return head-averaged support statistics using weight mass.
+
+        ``weights`` may have dropped entries and an explicit head dimension:
+        ``[B,Q,R,H,K]``.  The denominator is the valid softmax mass, never the
+        number of candidates, and only heads with at least one valid entry are
+        included in the final average.
+        """
+        valid_weights = weights * top_valid.to(weights.dtype)
+        mass = valid_weights.sum(-1).clamp_min(_EPS)
+        rel_h = (valid_weights * selected_rel).sum(-1) / mass
+        age_h = (valid_weights * selected_age).sum(-1) / mass
+        dist_h = (valid_weights * selected_dist).sum(-1) / mass
+        head_valid = top_valid.any(-1)
+        head_mass = head_valid.to(weights.dtype).sum(-1).clamp_min(1.)
+        rel = (rel_h * head_valid.to(rel_h.dtype)).sum(-1) / head_mass
+        age = (age_h * head_valid.to(age_h.dtype)).sum(-1) / head_mass
+        dist = (dist_h * head_valid.to(dist_h.dtype)).sum(-1) / head_mass
+        return rel, age, dist
+
+    @staticmethod
+    def concatenate_attention_heads(context_heads, head_valid):
+        """Keep valid head features at full scale before concatenation.
+
+        ``context_heads`` has shape ``[B,Q,R,H,D]``.  Heads are concatenated
+        into ``C=H*D``; they are not an ensemble to be averaged.  Head-count
+        normalization belongs only to scalar support statistics.
+        """
+        if context_heads.shape[:-1] != head_valid.shape:
+            raise ValueError(
+                'context_heads must be [B,Q,R,H,D] and head_valid [B,Q,R,H]')
+        return context_heads * head_valid.unsqueeze(-1).to(
+            context_heads.dtype)
+
+    def _coarse(self, query, points, sem, sem_weight, flat, effective_age, horizon):
+        B, Q, _ = query.shape
+        N = flat['feat'].shape[1]
+        # Geometry/feature retrieval is deliberately independent of the
+        # current explicit semantic distribution.  Semantic compatibility is
+        # added only in the second candidate path below.
+        q = self.query_proj(self.query_norm(query) + horizon).float()
+        k = self.key_proj(self.memory_norm(flat['feat'])).float()
+        feature = torch.einsum('bqc,bnc->bqn', q, k) / math.sqrt(self.embed_dims)
+        qc = points.float().mean(-2); mc = flat['points'].float().mean(-2)
+        dist = torch.sqrt(((qc[:, :, None] - mc[:, None]) ** 2).sum(-1).clamp_min(0.))
+        valid = flat['valid'] & torch.isfinite(flat['rel']) & (flat['rel'] > 0)
+        valid = valid & torch.isfinite(effective_age) & (effective_age > 0) & (effective_age <= self.max_effective_age)
+        geom = feature - dist.square() / (self.coarse_radius ** 2 + _EPS)
+        geom = geom - effective_age[:, None] / (self.max_effective_age + _EPS)
+        geom = geom + torch.log(flat['rel'].clamp_min(_EPS))[:, None]
+        gmask = valid[:, None] & (dist <= self.coarse_radius)
+        compat = torch.einsum('bqc,bnc->bqn', sem.mean(2), flat['semantic']).clamp_min(_EPS)
+        sem_score = geom + sem_weight.mean(2).unsqueeze(-1) * torch.log(compat)
+        kg, ks = min(self.coarse_topk_geometry, N), min(self.coarse_topk_semantic, N)
+        neg = torch.finfo(geom.dtype).min
+        gi = torch.topk(geom.masked_fill(~gmask, neg), kg, -1).indices
+        si = torch.topk(sem_score.masked_fill(~gmask, neg), ks, -1).indices
+        gv = torch.gather(gmask, -1, gi); sv = torch.gather(gmask, -1, si)
+        ui, uv = self._union(gi, gv, si, sv)
+        return ui, uv, gmask, dist, geom, sem_score, gi, gv, si, sv, k
+
+    def forward(self, query_feat, query_points_metric, baseline_logits, memory,
+                horizon_id, target_ego2global=None, return_diagnostics=True,
+                **kwargs):
+        del kwargs
+        if query_feat.dim() != 3 or query_points_metric.dim() != 4 or baseline_logits.dim() != 4:
+            raise ValueError('V2 expects [B,Q,C], [B,Q,R,3], [B,Q,R,C]')
+        B, Q, C = query_feat.shape
+        if C != self.embed_dims or query_points_metric.shape[2] != self.num_points or baseline_logits.shape[:3] != query_points_metric.shape[:3] or baseline_logits.shape[-1] != self.num_classes:
+            raise ValueError('V2 query shape does not match configured dimensions')
+        horizon_id = int(horizon_id)
+        if horizon_id not in (0, 1, 2):
+            raise ValueError('horizon_id must be 0, 1, or 2')
+        if memory is None or not memory:
+            return self._empty(query_feat, horizon_id)
+        memory_for_read = dict(memory)
+        source_ego = memory_for_read.get('memory_source_ego2global')
+        if source_ego is not None and target_ego2global is not None:
+            raw_points = memory_for_read['memory_points_metric'].to(
+                device=query_feat.device, dtype=query_feat.dtype)
+            if raw_points.dim() == 4:
+                raw_points = raw_points.unsqueeze(0)
+            source_ego = source_ego.to(device=query_feat.device, dtype=torch.float32)
+            target_ego2global = target_ego2global.to(device=query_feat.device, dtype=torch.float32)
+            if source_ego.dim() == 3:
+                source_ego = source_ego.unsqueeze(0)
+            if target_ego2global.dim() == 2:
+                target_ego2global = target_ego2global.unsqueeze(0)
+            memory_for_read['memory_points_metric'] = self.aligner(
+                raw_points, source_ego, target_ego2global)
+            memory_for_read.pop('memory_source_ego2global', None)
+        flat = self._reshape_memory(memory_for_read, B, query_feat.device, query_feat.dtype)
+        N = flat['feat'].shape[1]
+        if N == 0:
+            return self._empty(query_feat, horizon_id)
+        hs = float(self.HORIZON_SECONDS[horizon_id])
+        h = self.horizon_embedding.weight[horizon_id].to(query_feat).view(1, 1, 1, C).expand(B, Q, self.num_points, C)
+        (point_semantic, retrieval_semantic, semantic_entropy, uncertainty,
+         margin, semantic_weight, retrieval_semantic_weight,
+         dropped) = self._semantic_features(baseline_logits)
+        effective_age = flat['base_age'] + hs
+        (coarse_idx, coarse_valid, global_valid, coarse_dist, geom, sem_score,
+         geometry_idx, geometry_valid,
+         semantic_idx, semantic_valid, coarse_k) = self._coarse(
+            query_feat, query_points_metric, retrieval_semantic,
+            retrieval_semantic_weight, flat, effective_age, h[:, :, 0, :])
+        Ku = coarse_idx.shape[-1]; Rm = flat['points'].shape[-2]
+        context = query_feat.new_zeros(B, Q, self.num_points, C)
+        has = torch.zeros(B, Q, self.num_points, dtype=torch.bool, device=query_feat.device)
+        eligible_counts = torch.zeros(
+            B, Q, self.num_points, dtype=torch.long,
+            device=query_feat.device)
+        selected_counts = torch.zeros_like(eligible_counts)
+        srel = query_feat.new_zeros(B, Q, self.num_points)
+        sage = srel.clone()
+        sdist = srel.clone()
+        point_memory_semantic = query_feat.new_zeros(
+            B, Q, self.num_points, self.num_classes)
+        geometry_point_weight_mass = query_feat.new_zeros(
+            B, Q, self.num_points, self.num_geometry_heads)
+        semantic_point_weight_mass = query_feat.new_zeros(
+            B, Q, self.num_points, self.num_heads - self.num_geometry_heads)
+        max_L = 0
+        qbase = self.point_query_proj(self.query_norm(query_feat)).unsqueeze(2)
+        qpos = self.current_point_pos(query_points_metric.float()).to(query_feat.dtype)
+        coarse_v = self.value_proj(self.memory_norm(flat['feat']))
+        # Build two candidate-internal coarse reads.  Geometry and semantic
+        # routes use their own continuous scores after the stable deduplicated
+        # union; no unselected/all-memory summary can enter this context.
+        batch_index = torch.arange(
+            B, device=query_feat.device)[:, None, None]
+        safe_coarse_idx = coarse_idx.clamp_min(0)
+        kg = geometry_idx.shape[-1]
+        geometry_union_valid = torch.zeros_like(coarse_valid)
+        geometry_union_valid[..., :kg] = coarse_valid[..., :kg]
+        semantic_union_valid = torch.zeros_like(coarse_valid)
+        semantic_union_valid[..., kg:] = coarse_valid[..., kg:]
+        selected_geom_score = torch.gather(
+            geom, -1, safe_coarse_idx)
+        selected_sem_score = torch.gather(
+            sem_score, -1, safe_coarse_idx)
+        geometry_coarse_weights = safe_masked_softmax(
+            selected_geom_score, geometry_union_valid, dim=-1)
+        semantic_coarse_weights = safe_masked_softmax(
+            selected_sem_score, semantic_union_valid, dim=-1)
+        selected_coarse_value = coarse_v[batch_index, safe_coarse_idx]
+        geometry_coarse_context = (
+            geometry_coarse_weights[..., None].to(selected_coarse_value.dtype) *
+            selected_coarse_value).sum(-2).to(query_feat.dtype)
+        semantic_coarse_context = (
+            semantic_coarse_weights[..., None].to(selected_coarse_value.dtype) *
+            selected_coarse_value).sum(-2).to(query_feat.dtype)
+        geometry_has = geometry_union_valid.any(-1)
+        semantic_has = semantic_union_valid.any(-1)
+        both_routes = geometry_has & semantic_has
+        geometry_mix = torch.where(
+            both_routes,
+            coarse_valid.new_full((), self.coarse_geometry_context_weight,
+                                  dtype=query_feat.dtype),
+            geometry_has.to(query_feat.dtype))
+        semantic_mix = torch.where(
+            both_routes,
+            coarse_valid.new_full(
+                (), 1. - self.coarse_geometry_context_weight,
+                dtype=query_feat.dtype),
+            semantic_has.to(query_feat.dtype))
+        coarse_context = (
+            geometry_mix[..., None] * geometry_coarse_context +
+            semantic_mix[..., None] * semantic_coarse_context)
+        coarse_context = coarse_context * coarse_valid.any(-1).unsqueeze(
+            -1).to(coarse_context.dtype)
+        coarse_weights = (
+            geometry_mix[..., None] * geometry_coarse_weights +
+            semantic_mix[..., None] * semantic_coarse_weights)
+
+        # [B,Q,R,C]. Current qpoint conditions point attention, but is not
+        # itself added to the returned historical Point Memory Context.
+        semantic_query = self.semantic_query_proj(
+            retrieval_semantic.to(self.semantic_query_proj.weight.dtype)).to(
+                query_feat.dtype)
+        head_is_geometry = torch.arange(
+            self.num_heads, device=query_feat.device) < self.num_geometry_heads
+        head_is_geometry = head_is_geometry.view(1, 1, 1, self.num_heads, 1)
+        # Build the Point-Attention query per chunk instead of materialising
+        # geometry and semantic versions for every active Query at once.  The
+        # returned attention_query is an audit snapshot and is intentionally
+        # detached; gradients still flow through each chunk's qpoint into the
+        # point-query projection while the context is computed.
+        attention_query = (query_feat.new_empty(
+            B, Q, self.num_points, C) if return_diagnostics else None)
+        for start in range(0, Q, self.query_chunk_size):
+            stop = min(Q, start + self.query_chunk_size)
+            idx = coarse_idx[:, start:stop].clamp_min(0); cv = coarse_valid[:, start:stop]
+            bi = torch.arange(B, device=query_feat.device)[:, None, None]
+            mf = flat['feat'][bi, idx]; ms = flat['semantic'][bi, idx]; mp = flat['points'][bi, idx]
+            mk = coarse_k[bi, idx]; mv = coarse_v[bi, idx]
+            mr = flat['rel'][bi, idx]; ma = effective_age[bi, idx]
+            rm = mp.shape[-2]; L = Ku * rm; max_L = max(max_L, L)
+            hf = mf.unsqueeze(-2).expand(-1, -1, -1, rm, -1).reshape(B, stop-start, L, C)
+            hk_query = mk.unsqueeze(-2).expand(-1, -1, -1, rm, -1).reshape(B, stop-start, L, C)
+            hv_query = mv.unsqueeze(-2).expand(-1, -1, -1, rm, -1).reshape(B, stop-start, L, C)
+            hsx = ms.unsqueeze(-2).expand(-1, -1, -1, rm, -1).reshape(B, stop-start, L, self.num_classes)
+            hp = mp.reshape(B, stop-start, L, 3)
+            hr = mr.unsqueeze(-1).expand(-1, -1, -1, rm).reshape(B, stop-start, L)
+            ha = ma.unsqueeze(-1).expand(-1, -1, -1, rm).reshape(B, stop-start, L)
+            hvld = flat['valid'][bi, idx] & (ma > 0) & (ma <= self.max_effective_age)
+            hvld = hvld.unsqueeze(-1).expand(-1, -1, -1, rm).reshape(B, stop-start, L)
+            coarse_point_valid = cv.unsqueeze(-1).expand(-1, -1, -1, rm).reshape(B, stop-start, L)
+            hvld = hvld & coarse_point_valid
+            chunk_geometry_union_valid = geometry_union_valid[:, start:stop]
+            geometry_point_valid = chunk_geometry_union_valid.unsqueeze(-1).expand(
+                -1, -1, -1, rm).reshape(B, stop-start, L)
+            geometry_hvld = hvld & geometry_point_valid
+            qpos_chunk = qpos[:, start:stop]
+            qpoint_geometry = (
+                qbase[:, start:stop] + qpos_chunk +
+                h[:, start:stop] +
+                geometry_coarse_context[:, start:stop].unsqueeze(2))
+            qpoint_semantic = (
+                qbase[:, start:stop] + qpos_chunk +
+                h[:, start:stop] + coarse_context[:, start:stop].unsqueeze(2) +
+                semantic_query[:, start:stop])
+            qpoint_geometry_heads = qpoint_geometry.float().view(
+                B, stop - start, self.num_points, self.num_heads, -1)
+            qpoint_semantic_heads = qpoint_semantic.float().view(
+                B, stop - start, self.num_points, self.num_heads, -1)
+            qpoint_heads = torch.where(
+                head_is_geometry, qpoint_geometry_heads,
+                qpoint_semantic_heads)
+            qpoint = qpoint_heads.reshape(
+                B, stop - start, self.num_points, C).to(query_feat.dtype)
+            if attention_query is not None:
+                attention_query[:, start:stop] = qpoint.detach()
+            qk = qpoint_heads
+            # Reuse the normalized historical point features for both key and
+            # value projections.  The previous implementation evaluated
+            # memory_norm(hf) twice and evaluated memory_point_pos(hp) a
+            # second time while building ``vv``.  Those duplicate activation
+            # graphs are numerically identical but can exceed a 24GB card at
+            # the first training iteration.  Reusing them preserves the
+            # point-level data flow and gradients while removing the copies.
+            normalized_hf = self.memory_norm(hf)
+            point_key = self.point_key_proj(normalized_hf)
+            point_pos = self.memory_point_pos(hp.float()).to(hf.dtype)
+            semantic_key = self.semantic_memory_proj(
+                hsx.to(self.semantic_memory_proj.weight.dtype)).to(hf.dtype)
+            hk_geometry = (hk_query + point_key + point_pos).float().view(
+                B, stop-start, L, self.num_heads, -1)
+            hk_semantic = (hk_query + point_key + point_pos + semantic_key).float().view(
+                B, stop-start, L, self.num_heads, -1)
+            hk = torch.where(head_is_geometry, hk_geometry, hk_semantic)
+            point_value = self.point_value_proj(normalized_hf)
+            vv = (hv_query + point_value + point_pos).float().view(
+                B, stop-start, L, self.num_heads, -1)
+            score = torch.einsum('bqrhd,bqlhd->bqrhl', qk, hk) / math.sqrt(self.head_dim)
+            pd = torch.sqrt(((query_points_metric[:, start:stop, :, None] - hp[:, :, None]) ** 2).sum(-1).clamp_min(0.))
+            compat = torch.einsum(
+                'bqrc,bqlc->bqrl',
+                retrieval_semantic[:, start:stop], hsx).clamp_min(_EPS)
+            semantic_score_term = retrieval_semantic_weight[:, start:stop].unsqueeze(-1).unsqueeze(-1) * torch.log(compat).unsqueeze(-2)
+            score = score - pd.square().unsqueeze(-2) / (self.point_radius ** 2 + _EPS) - ha[:, :, None, None, :] / (self.max_effective_age + _EPS) + torch.log(hr.clamp_min(_EPS))[:, :, None, None, :] + torch.where(head_is_geometry, torch.zeros_like(semantic_score_term), semantic_score_term)
+            eligible_mask = (
+                hvld[:, :, None, :] & (pd <= self.point_radius))
+            geometry_eligible_mask = (
+                geometry_hvld[:, :, None, :] & (pd <= self.point_radius))
+            pmask = torch.where(
+                head_is_geometry,
+                geometry_eligible_mask.unsqueeze(-2),
+                eligible_mask.unsqueeze(-2)).expand(
+                    -1, -1, -1, self.num_heads, -1)
+            pk = min(self.point_topk, L)
+            ts, ti = torch.topk(score.masked_fill(~pmask, torch.finfo(score.dtype).min), pk, -1)
+            tv = torch.gather(pmask, -1, ti)
+            w = self.dropout(safe_masked_softmax(ts, tv, -1))
+            gather = ti.transpose(-1, -2)[..., None].expand(B, stop-start, self.num_points, pk, self.num_heads, self.head_dim)
+            sv = torch.gather(vv[:, :, None].expand(B, stop-start, self.num_points, L, self.num_heads, self.head_dim), 3, gather).transpose(3, 4)
+            # Collapse valid heads only after the per-head weighted read.
+            context_heads = (w[..., None] * sv).sum(-2)
+            head_valid = tv.any(-1)
+            head_den = head_valid.float().sum(-1).clamp_min(1.)
+            context_heads = self.concatenate_attention_heads(
+                context_heads, head_valid)
+            context[:, start:stop] = context_heads.reshape(B, stop-start, self.num_points, C).to(context.dtype)
+            eligible_counts[:, start:stop] = eligible_mask.sum(-1)
+            selected_counts[:, start:stop] = tv.sum(-1).amax(-1)
+            has[:, start:stop] = selected_counts[:, start:stop] > 0
+            sr = torch.gather(hr[:, :, None, None, :].expand(B, stop-start, self.num_points, self.num_heads, L), -1, ti)
+            sa = torch.gather(ha[:, :, None, None, :].expand(B, stop-start, self.num_points, self.num_heads, L), -1, ti)
+            sd = torch.gather(pd.unsqueeze(-2).expand(B, stop-start, self.num_points, self.num_heads, L), -1, ti)
+            vw = w * tv.to(w.dtype); mass = vw.sum(-1).clamp_min(_EPS)
+            srel[:, start:stop], sage[:, start:stop], sdist[:, start:stop] = self.aggregate_support_statistics(
+                w, tv, sr, sa, sd)
+            ss = torch.gather(hsx[:, :, None, None].expand(B, stop-start, self.num_points, self.num_heads, L, self.num_classes), 4, ti[..., None].expand(B, stop-start, self.num_points, self.num_heads, pk, self.num_classes))
+            mean_s = (vw[..., None] * ss).sum(-2) / mass[..., None]
+            mean_s = (
+                mean_s *
+                head_valid[..., None].to(mean_s.dtype)).sum(-2) / (
+                    head_den[..., None])
+            point_memory_semantic[:, start:stop] = torch.where(
+                has[:, start:stop].unsqueeze(-1), mean_s,
+                torch.zeros_like(mean_s)).to(point_memory_semantic.dtype)
+            geometry_point_weight_mass[:, start:stop] = w[..., :self.num_geometry_heads, :].mul(
+                tv[..., :self.num_geometry_heads, :].to(w.dtype)).sum(-1)
+            if self.num_geometry_heads < self.num_heads:
+                semantic_point_weight_mass[:, start:stop] = w[..., self.num_geometry_heads:, :].mul(
+                    tv[..., self.num_geometry_heads:, :].to(w.dtype)).sum(-1)
+        # Only selected historical point values reach Point Memory Context.
+        # Current qpoint and pooling over all Memory queries are excluded.
+        context = self.out_proj(context.to(self.out_proj.weight.dtype)).to(query_feat.dtype) * has.unsqueeze(-1).to(query_feat.dtype)
+        semantic_difference, semantic_cosine, semantic_js = \
+            self.semantic_disagreement_features(
+                point_semantic, point_memory_semantic, has)
+        # Scalar order: eligible/capacity, selected/point_topk, reliability,
+        # effective age, distance, normalized entropy, margin, semantic weight,
+        # cosine similarity, and JS divergence.
+        scalar_features = torch.stack([
+            eligible_counts.float() / float(max(Ku * Rm, 1)),
+            selected_counts.float() / float(max(self.point_topk, 1)),
+            srel,
+            (sage / (self.max_effective_age + _EPS)).clamp(0, 1),
+            (sdist / (self.point_radius + _EPS)).clamp(0, 1),
+            uncertainty,
+            margin,
+            semantic_weight,
+            semantic_cosine,
+            semantic_js,
+        ], -1).to(query_feat.dtype)
+        # The adapter MLP is evaluated in the same query chunks as Point
+        # Attention.  Building one [B,Q,R,adapter_input_dims] activation for
+        # all active queries is needlessly expensive on the 24 GB training
+        # cards and also keeps every intermediate MLP activation live until
+        # the final horizon loss.  Chunking changes neither the affine maps
+        # nor their gradients; concatenation/assignment only restores the
+        # original output shapes.
+        qexpanded = query_feat.unsqueeze(2).expand(-1, -1, self.num_points, -1)
+        delta_s = query_feat.new_zeros(B, Q, self.num_points, self.num_classes)
+        delta_o = query_feat.new_zeros(B, Q, self.num_points, 1)
+        delta_p = query_feat.new_zeros(B, Q, self.num_points, 3)
+        gate = query_feat.new_zeros(B, Q, self.num_points, 1)
+        gate_occ = query_feat.new_zeros(B, Q, self.num_points, 1)
+        gate_pos = torch.zeros_like(gate_occ)
+        for start in range(0, Q, self.query_chunk_size):
+            stop = min(Q, start + self.query_chunk_size)
+            adapter_input = torch.cat([
+                qexpanded[:, start:stop], qpos[:, start:stop],
+                context[:, start:stop],
+                qexpanded[:, start:stop] - context[:, start:stop],
+                h[:, start:stop],
+                point_semantic[:, start:stop].to(query_feat.dtype),
+                point_memory_semantic[:, start:stop].to(query_feat.dtype),
+                semantic_difference[:, start:stop].to(query_feat.dtype),
+                scalar_features[:, start:stop]], -1)
+            if adapter_input.shape[-1] != self.adapter_input_dims:
+                raise RuntimeError(
+                    'FutureMemoryAdapterV2 adapter input has '
+                    f'{adapter_input.shape[-1]} features, expected '
+                    f'{self.adapter_input_dims}')
+            adapted = self.adapter(adapter_input)
+            delta_s[:, start:stop] = self.delta_s_head(adapted)
+            delta_o[:, start:stop] = self.delta_o_head(adapted)
+            delta_p[:, start:stop] = self.delta_p_head(adapted)
+            gs, go, gp = self.task_gates(adapted, horizon_id)
+            gate[:, start:stop] = gs
+            gate_occ[:, start:stop] = go
+            gate_pos[:, start:stop] = gp
+        point_mask = has.unsqueeze(-1).to(gate.dtype)
+        delta_s = delta_s * point_mask
+        delta_o = delta_o * point_mask
+        delta_p = delta_p * point_mask
+        gate = gate * point_mask
+        gate_occ = gate_occ * point_mask
+        gate_pos = gate_pos * point_mask
+        if not return_diagnostics:
+            return dict(delta_s=delta_s, delta_o=delta_o, delta_p=delta_p,
+                        gate=gate, point_gate=gate, gate_sem=gate,
+                        gate_occ=gate_occ, gate_pos=gate_pos)
+
+        diagnostics = dict(has_candidate=has,
+                           eligible_point_count=eligible_counts.detach(),
+                           selected_point_count=selected_counts.detach(),
+                           coarse_candidate_count=coarse_valid.sum(-1),
+                           coarse_indices=coarse_idx.detach(), coarse_valid=coarse_valid.detach(),
+                           coarse_attention_weights=coarse_weights.detach(),
+                           coarse_context=coarse_context.detach(),
+                           coarse_geometry_context=geometry_coarse_context.detach(),
+                           coarse_semantic_context=semantic_coarse_context.detach(),
+                           coarse_geometry_weight=geometry_mix.detach(),
+                           coarse_semantic_weight=semantic_mix.detach(),
+                           geometry_indices=geometry_idx.detach(), geometry_valid=geometry_valid.detach(),
+                           semantic_indices=semantic_idx.detach(), semantic_valid=semantic_valid.detach(),
+                           geometry_candidate_count=geometry_valid.sum(-1),
+                           semantic_candidate_count=semantic_valid.sum(-1),
+                           eligible_coarse_candidate_count=global_valid.sum(-1),
+                           support_reliability=srel.detach(), support_age=sage.detach(), average_age=sage.detach(),
+                           support_distance=sdist.detach(), average_distance=sdist.detach(),
+                           base_age=flat['base_age'].detach(), effective_age=effective_age.detach(),
+                           time_penalty=(effective_age / (self.max_effective_age + _EPS)).detach(),
+                           horizon_seconds=hs,
+                           semantic_entropy=semantic_entropy.detach(),
+                           semantic_uncertainty=uncertainty.detach(),
+                           semantic_margin=margin.detach(),
+                           semantic_weight=semantic_weight.detach(),
+                           retrieval_semantic_weight=retrieval_semantic_weight.detach(),
+                           semantic_dropout_mask=dropped.detach(),
+                           point_semantic_current=point_semantic.detach(),
+                           point_semantic_memory=point_memory_semantic.detach(),
+                           semantic_difference=semantic_difference.detach(),
+                           semantic_cosine=semantic_cosine.detach(),
+                           semantic_js_divergence=semantic_js.detach(),
+                           semantic_disagreement=semantic_js.detach(),
+                           geometry_point_weight_mass=geometry_point_weight_mass.detach(),
+                           semantic_point_weight_mass=semantic_point_weight_mass.detach(),
+                           num_geometry_heads=self.num_geometry_heads,
+                           coarse_score_shape=tuple(geom.shape), point_attention_shape=(B, min(self.query_chunk_size, Q), self.num_points, self.num_heads, max_L),
+                           attention_shape=(B, min(self.query_chunk_size, Q), self.num_points, self.num_heads, max_L))
+        # Diagnostics are consumed for logging/tests only.  Keeping these
+        # large tensors attached to the training graph duplicates the V2
+        # activation footprint for every future horizon, so expose detached
+        # snapshots while the returned residuals retain their gradients.
+        diagnostics['point_context'] = context.detach()
+        diagnostics['point_gate'] = gate.detach()
+        diagnostics['gate_sem'] = gate.detach()
+        diagnostics['gate_occ'] = gate_occ.detach()
+        diagnostics['gate_pos'] = gate_pos.detach()
+        return dict(delta_s=delta_s, delta_o=delta_o, delta_p=delta_p,
+                    gate=gate, point_gate=gate, context=context,
+                    gate_sem=gate, gate_occ=gate_occ, gate_pos=gate_pos,
+                    point_context=context, attention_query=attention_query,
+                    diagnostics=diagnostics)
+
+
+def sparse_soft_voxel_iou_loss(semantic_logits, occupancy_logits, points,
+                               gt_voxel_semantics, points_mask=None,
+                               pc_range=(-40., -40., -1., 40., 40., 5.4),
+                               voxel_size=(0.4, 0.4, 0.4), num_classes=17,
+                               class_weights=None, eps=1e-6,
+                               voxel_center_offset=0.0,
+                               renormalize_valid_corners=False):
+    """Sparse, differentiable noisy-OR Soft-IoU over trilinear voxels.
+
+    Only eight neighbours per valid point and the union with non-empty GT
+    voxels are materialised.  This avoids a dense ``B*200*200*16*17`` tensor
+    while retaining gradients through continuous point positions.
+
+    The legacy grid uses corner indices (offset 0). The experimental
+    centre-aligned variant uses offset 0.5 so index k represents the centre
+    of GT voxel k. The default preserves existing V2 training behavior.
+    """
+    B, Q, R, C = semantic_logits.shape
+    device = semantic_logits.device
+    dtype = semantic_logits.dtype
+    if points_mask is None:
+        points_mask = torch.ones(B, Q, R, dtype=torch.bool, device=device)
+    probs = torch.sigmoid(occupancy_logits.squeeze(-1)).unsqueeze(-1) * F.softmax(semantic_logits, dim=-1)
+    metric = decode_points_metric(points, pc_range).float()
+    origin = torch.as_tensor(pc_range[:3], device=device, dtype=torch.float32)
+    vs = torch.as_tensor(voxel_size, device=device, dtype=torch.float32)
+    grid = torch.as_tensor(gt_voxel_semantics.shape[1:4], device=device, dtype=torch.long)
+    offsets = torch.tensor([[i, j, k] for i in (0, 1) for j in (0, 1) for k in (0, 1)], device=device)
+    weights_cls = prepare_class_weights(
+        class_weights, num_classes, device, dtype)
+    if weights_cls is None:
+        weights_cls = torch.ones(
+            num_classes, device=device, dtype=dtype)
+    total = semantic_logits.new_zeros(())
+    for b in range(B):
+        gt = gt_voxel_semantics[b].long()
+        gt_idx = torch.nonzero(gt != num_classes, as_tuple=False)
+        if gt_idx.numel():
+            gt_lin = gt_idx[:, 0] * grid[1] * grid[2] + gt_idx[:, 1] * grid[2] + gt_idx[:, 2]
+        else:
+            gt_lin = torch.zeros(0, dtype=torch.long, device=device)
+        p = metric[b].reshape(-1, 3)
+        pp = probs[b].reshape(-1, num_classes)
+        valid = points_mask[b].reshape(-1).bool() & torch.isfinite(p).all(-1)
+        p, pp = p[valid], pp[valid]
+        coord = (p - origin) / vs - float(voxel_center_offset)
+        base = torch.floor(coord).long()
+        frac = (coord - base.float()).clamp(0., 1.)
+        idx = base[:, None, :] + offsets[None]
+        inside = ((idx >= 0) & (idx < grid)).all(-1)
+        if renormalize_valid_corners:
+            # Hard decoding ignores points outside the scene. A slightly
+            # outside point must not be snapped back onto a boundary voxel.
+            point_inside = ((p >= origin) & (p < origin + grid * vs)).all(-1)
+            inside = inside & point_inside[:, None]
+        corner_w = torch.stack([
+            torch.where(offsets[:, d].bool(), frac[:, None, d], 1. - frac[:, None, d])
+            for d in range(3)], dim=-1).prod(-1)
+        if renormalize_valid_corners:
+            # At the scene boundary, discard out-of-grid neighbours and keep
+            # the probability mass of valid points on the remaining corners.
+            # Fully out-of-grid points have zero mass and stay ignored.
+            corner_w = corner_w * inside.to(corner_w.dtype)
+            mass = corner_w.sum(-1, keepdim=True)
+            corner_w = corner_w / mass.clamp_min(eps)
+        lin = idx[..., 0] * grid[1] * grid[2] + idx[..., 1] * grid[2] + idx[..., 2]
+        pred_lin = lin[inside]
+        union = torch.unique(torch.cat([pred_lin, gt_lin])) if (pred_lin.numel() or gt_lin.numel()) else pred_lin
+        if union.numel() == 0:
+            total = total + semantic_logits[b].sum() * 0.
+            continue
+        pred_vox = semantic_logits.new_zeros(union.numel(), num_classes)
+        if pred_lin.numel():
+            inv = torch.searchsorted(union, pred_lin)
+            # Boolean indexing preserves the point/corner alignment.
+            contrib_all = corner_w[..., None] * pp[:, None, :]
+            contrib = contrib_all[inside]
+            pred_vox.index_add_(0, inv, contrib.to(dtype))
+            pred_vox = 1. - torch.exp(-pred_vox)
+        target = semantic_logits.new_zeros(union.numel(), num_classes)
+        if gt_lin.numel():
+            inv_gt = torch.searchsorted(union, gt_lin)
+            labels = gt[gt_idx[:, 0], gt_idx[:, 1], gt_idx[:, 2]].clamp(0, num_classes - 1)
+            target[inv_gt, labels] = 1.
+        inter = (pred_vox * target).sum(0)
+        den = pred_vox.sum(0) + target.sum(0) - inter
+        total = total + (weights_cls * (1. - inter / den.clamp_min(eps))).sum() / weights_cls.sum().clamp_min(eps)
+    return total / max(B, 1)
+
+
+def future_memory_v2_occupancy_targets(
+        points, points_mask, gt_voxel_semantics, pc_range,
+        voxel_size=(0.4, 0.4, 0.4), empty_label=17,
+        positive_radius=None):
+    """Build point occupancy targets consistent with voxel evaluation.
+
+    A point is positive when it already falls inside a non-empty GT voxel or
+    when it is close to the centre of a non-empty GT voxel.  Exact voxel
+    membership takes precedence for the semantic label.  The proximity route
+    keeps the original point-to-centre supervision for points just outside a
+    target voxel, but its default radius is the half diagonal of the voxel,
+    not half of one side.  Consequently, no point inside a non-empty voxel is
+    incorrectly trained as empty merely because it is near a voxel corner.
+    """
+    if points.dim() != 4 or points.shape[-1] != 3:
+        raise ValueError(
+            'points must have shape [B,Q,R,3], got '
+            f'{tuple(points.shape)}')
+    B, Q, R, _ = points.shape
+    device = points.device
+    gt_tensor = torch.as_tensor(
+        gt_voxel_semantics, device=device, dtype=torch.long)
+    if gt_tensor.dim() != 4 or gt_tensor.shape[0] != B:
+        raise ValueError(
+            'gt_voxel_semantics must have shape [B,X,Y,Z], got '
+            f'{tuple(gt_tensor.shape)}')
+    if points_mask is None:
+        points_mask = torch.ones(
+            B, Q, R, dtype=torch.bool, device=device)
+    else:
+        points_mask = points_mask.to(device=device, dtype=torch.bool)
+        if points_mask.shape != (B, Q, R):
+            raise ValueError(
+                'points_mask must have shape [B,Q,R], got '
+                f'{tuple(points_mask.shape)}')
+
+    metric = decode_points_metric(points, pc_range).float()
+    origin = torch.as_tensor(
+        pc_range[:3], device=device, dtype=torch.float32)
+    voxel_size = torch.as_tensor(
+        voxel_size, device=device, dtype=torch.float32).flatten()
+    if voxel_size.numel() != 3 or bool((voxel_size <= 0).any()):
+        raise ValueError('voxel_size must contain three positive values')
+    if positive_radius is None:
+        # The farthest location inside a voxel is half of its 3-D diagonal.
+        radius = float(torch.linalg.vector_norm(voxel_size).item()) * 0.5
+    else:
+        radius = float(positive_radius)
+        if radius < 0:
+            raise ValueError('positive_radius must be non-negative or None')
+
+    grid = torch.as_tensor(
+        gt_tensor.shape[1:4], device=device, dtype=torch.long)
+    index = torch.floor((metric - origin) / voxel_size).long()
+    inside = ((index >= 0) & (index < grid)).all(-1)
+    safe = index.clamp_min(0)
+    for dim in range(3):
+        safe[..., dim] = safe[..., dim].clamp_max(grid[dim] - 1)
+    batch = torch.arange(
+        B, device=device)[:, None, None].expand(B, Q, R)
+    voxel_labels = gt_tensor[
+        batch, safe[..., 0], safe[..., 1], safe[..., 2]]
+    valid = points_mask & inside & torch.isfinite(metric).all(-1)
+    voxel_positive = valid & (voxel_labels != int(empty_label))
+
+    nearest_dist = torch.full(
+        (B, Q, R), float('inf'), device=device)
+    nearest_label = torch.zeros(
+        (B, Q, R), dtype=torch.long, device=device)
+    for b in range(B):
+        gt_idx = torch.nonzero(
+            gt_tensor[b] != int(empty_label), as_tuple=False)
+        if gt_idx.numel() == 0:
+            continue
+        gt_centres = ((gt_idx.float() + 0.5) * voxel_size + origin)
+        gt_labels = gt_tensor[b][
+            gt_idx[:, 0], gt_idx[:, 1], gt_idx[:, 2]]
+        pred_flat = metric[b].reshape(-1, 3)
+        near = torch.full(
+            (pred_flat.shape[0],), float('inf'), device=device)
+        near_idx = torch.zeros(
+            pred_flat.shape[0], dtype=torch.long, device=device)
+        # Both axes are chunked; no point-by-all-GT matrix is retained.
+        for point_start in range(0, pred_flat.shape[0], 2048):
+            point_stop = min(pred_flat.shape[0], point_start + 2048)
+            local_dist = torch.full(
+                (point_stop - point_start,), float('inf'), device=device)
+            local_idx = torch.zeros(
+                point_stop - point_start, dtype=torch.long, device=device)
+            for gt_start in range(0, gt_centres.shape[0], 8192):
+                gt_stop = min(gt_centres.shape[0], gt_start + 8192)
+                distance = torch.cdist(
+                    pred_flat[point_start:point_stop],
+                    gt_centres[gt_start:gt_stop])
+                distance_min, distance_idx = distance.min(-1)
+                update = distance_min < local_dist
+                local_dist = torch.where(update, distance_min, local_dist)
+                local_idx = torch.where(
+                    update, distance_idx + gt_start, local_idx)
+            near[point_start:point_stop] = local_dist
+            near_idx[point_start:point_stop] = local_idx
+        nearest_dist[b] = near.reshape(Q, R)
+        nearest_label[b] = gt_labels[near_idx].reshape(Q, R)
+
+    proximity_positive = valid & (nearest_dist <= radius)
+    positive = voxel_positive | proximity_positive
+    # A point already inside a labelled voxel must use that exact class even
+    # if another class happens to have a closer neighbouring voxel centre.
+    target_labels = torch.where(
+        voxel_positive, voxel_labels, nearest_label)
+    return dict(
+        positive=positive, valid=valid, labels=target_labels,
+        voxel_positive=voxel_positive,
+        proximity_positive=proximity_positive,
+        nearest_distance=nearest_dist, positive_radius=radius)
+
+
+def _balanced_binary_group_mean(
+        values, positive, valid, positive_weight=1.0,
+        negative_weight=1.0, positive_mean_override=None):
+    """Average positive and negative groups without count domination."""
+    positive_weight = float(positive_weight)
+    negative_weight = float(negative_weight)
+    if positive_weight < 0 or negative_weight < 0:
+        raise ValueError('binary group weights must be non-negative')
+    if positive_weight == 0 and negative_weight == 0:
+        raise ValueError('at least one binary group weight must be positive')
+    positive_mask = valid & positive
+    negative_mask = valid & ~positive
+    value_dtype = values.dtype
+    positive_count = positive_mask.to(value_dtype).sum()
+    negative_count = negative_mask.to(value_dtype).sum()
+    positive_mean = (
+        (values * positive_mask.to(value_dtype)).sum() /
+        positive_count.clamp_min(1.))
+    if positive_mean_override is not None:
+        positive_mean = positive_mean_override
+    negative_mean = (
+        (values * negative_mask.to(value_dtype)).sum() /
+        negative_count.clamp_min(1.))
+    positive_present = (positive_count > 0).to(value_dtype)
+    negative_present = (negative_count > 0).to(value_dtype)
+    normalizer = (
+        positive_weight * positive_present +
+        negative_weight * negative_present).clamp_min(_EPS)
+    return (
+        positive_weight * positive_present * positive_mean +
+        negative_weight * negative_present * negative_mean) / normalizer
+
+
+def validate_occupancy_class_balance_beta(beta_by_horizon):
+    """Validate the opt-in loss-only mapping without changing its config."""
+    if not isinstance(beta_by_horizon, Mapping):
+        raise ValueError('occupancy_positive_class_balance_beta must be a '
+                         'mapping keyed by 1s, 2s, or 3s')
+    normalized = {}
+    for horizon, value in beta_by_horizon.items():
+        if horizon not in ('1s', '2s', '3s'):
+            raise ValueError(f'Unknown occupancy class-balance horizon: {horizon!r}')
+        beta = float(value)
+        if not math.isfinite(beta) or not 0. <= beta <= 1.:
+            raise ValueError(f'Occupancy class-balance beta for {horizon} '
+                             f'must be finite and in [0, 1], got {value!r}')
+        normalized[horizon] = beta
+    return normalized
+
+
+def class_balanced_occupancy_bce(
+        values, positive, valid, labels, num_classes, beta,
+        positive_weight=1.0, negative_weight=1.0,
+        voxel_positive=None, return_diagnostics=False):
+    """Mix positive point/class means; retain the original negative mean.
+
+    All inputs except scalars have shape [B,Q,R]. Class means use *GT target*
+    labels, not predicted classes or semantic class weights. Only classes
+    present among valid positives participate. Reduction is rank-local over
+    the whole local batch, like the existing positive/negative group means;
+    DDP subsequently averages rank losses. No dense [points, classes] tensor
+    or extra distributed collective is needed.
+    """
+    beta = float(beta)
+    if not math.isfinite(beta) or not 0. <= beta <= 1.:
+        raise ValueError(f'Occupancy class-balance beta must be finite and '
+                         f'in [0, 1], got {beta!r}')
+    if beta == 0. and not return_diagnostics:
+        # Exact legacy reduction, including its dtype and operation order.
+        return _balanced_binary_group_mean(
+            values, positive, valid, positive_weight, negative_weight), {}
+    if num_classes <= 0:
+        raise ValueError('num_classes must be positive')
+    if any(t.shape != values.shape for t in (positive, valid, labels)):
+        raise ValueError('occupancy values, masks and labels must have matching shapes')
+    pos_mask = positive & valid
+    neg_mask = ~positive & valid
+    class_ids = labels[pos_mask].long()
+    if bool(((class_ids < 0) | (class_ids >= num_classes)).any()):
+        raise ValueError(f'Positive occupancy GT labels must be in [0, {num_classes})')
+    # FP32 accumulation avoids count/sum overflow for FP16 local batches.
+    # Preserve double precision when explicitly supplied by a pure-function test.
+    acc = values if values.dtype == torch.float64 else values.float()
+    class_count = torch.bincount(class_ids, minlength=num_classes)
+    class_sum = acc.new_zeros(num_classes).scatter_add(0, class_ids, acc[pos_mask])
+    present = class_count > 0
+    class_means = class_sum / class_count.clamp_min(1).to(acc.dtype)
+    class_mean = class_means.sum() / present.sum().clamp_min(1).to(acc.dtype)
+    point_mean = acc[pos_mask].sum() / pos_mask.sum().clamp_min(1).to(acc.dtype)
+    mixed_mean = (1. - beta) * point_mean + beta * class_mean
+    if beta == 0.:
+        loss = _balanced_binary_group_mean(
+            values, positive, valid, positive_weight, negative_weight)
+    else:
+        loss = _balanced_binary_group_mean(
+            acc, positive, valid, positive_weight, negative_weight,
+            positive_mean_override=mixed_mean)
+    if not return_diagnostics:
+        return loss, {}
+    if voxel_positive is None or voxel_positive.shape != values.shape:
+        raise ValueError('voxel_positive with matching shape is required for diagnostics')
+    exact_mask = pos_mask & voxel_positive
+    # Proximity positives can overlap exact positives; count ONLY their
+    # complement so exact + proximity-only == total, for every class.
+    exact_count = torch.bincount(labels[exact_mask].long(), minlength=num_classes)
+    proximity_only_count = class_count - exact_count
+    stats = dict(
+        occ_class_balance_beta=acc.new_tensor(beta),
+        occ_positive_count=pos_mask.sum(),
+        occ_negative_count=neg_mask.sum(),
+        occ_positive_present_classes=present.sum(),
+        occ_positive_voxel_count=exact_count.sum(),
+        occ_positive_proximity_only_count=proximity_only_count.sum(),
+        occ_positive_bce_point_mean=point_mean,
+        occ_positive_bce_class_mean=class_mean,
+        occ_positive_bce_mixed_mean=mixed_mean,
+        occ_negative_bce_mean=(acc[neg_mask].sum() /
+                               neg_mask.sum().clamp_min(1).to(acc.dtype)))
+    for c in range(num_classes):
+        stats[f'occ_positive_count_c{c}'] = class_count[c]
+        stats[f'occ_positive_voxel_count_c{c}'] = exact_count[c]
+        stats[f'occ_positive_proximity_only_count_c{c}'] = proximity_only_count[c]
+    # Logging only: no 'loss' token, no graph retention, fixed keys even for
+    # empty masks/classes on one DDP rank. MMCV logs rank-averaged counts.
+    return loss, {key: value.detach().float() for key, value in stats.items()}
+
+
+def future_memory_v2_point_losses(
+        semantic_logits, occupancy_logits, points, points_mask,
+        gt_voxel_semantics, pc_range, voxel_size=(0.4, 0.4, 0.4),
+        empty_label=17, class_weights=None, score_thresholds=0.1,
+        positive_radius=None, threshold_margin=0.1,
+        occupancy_positive_weight=1.0, occupancy_negative_weight=1.0,
+        threshold_positive_weight=1.0, threshold_negative_weight=1.0,
+        baseline_occupancy_logits=None, soft_voxel_center_offset=0.0,
+        soft_voxel_renormalize_valid_corners=False,
+        occupancy_positive_class_balance_beta=0.0,
+        occupancy_class_balance_diagnostics=False):
+    """Compute V2 point and sparse-voxel losses without model state.
+
+    This is the implementation used by SparseWorld4DTraj. Keeping it as a pure
+    function makes list/tuple/Tensor class-weight handling and empty-input
+    safety directly testable without importing optional CUDA extensions.
+    """
+    expected_occupancy_shape = semantic_logits.shape[:-1] + (1,)
+    if (semantic_logits.dim() != 4 or
+            occupancy_logits.shape != expected_occupancy_shape):
+        raise ValueError(
+            'semantic_logits and occupancy_logits must be [B,Q,R,C] and '
+            '[B,Q,R,1]')
+    B, Q, R, C = semantic_logits.shape
+    if points.shape != (B, Q, R, 3):
+        raise ValueError(
+            'points must have shape [B,Q,R,3], got '
+            f'{tuple(points.shape)}')
+    device = semantic_logits.device
+    dtype = semantic_logits.dtype
+    if points_mask is None:
+        points_mask = torch.ones(
+            B, Q, R, dtype=torch.bool, device=device)
+    else:
+        points_mask = points_mask.to(device=device, dtype=torch.bool)
+        if points_mask.shape != (B, Q, R):
+            raise ValueError(
+                'points_mask must have shape [B,Q,R], got '
+                f'{tuple(points_mask.shape)}')
+    gt_tensor = torch.as_tensor(
+        gt_voxel_semantics, device=device, dtype=torch.long)
+    if gt_tensor.dim() != 4 or gt_tensor.shape[0] != B:
+        raise ValueError(
+            'gt_voxel_semantics must have shape [B,X,Y,Z], got '
+            f'{tuple(gt_tensor.shape)}')
+
+    voxel_size = torch.as_tensor(
+        voxel_size, device=device, dtype=torch.float32).flatten()
+    if voxel_size.numel() != 3 or (voxel_size <= 0).any():
+        raise ValueError('voxel_size must contain three positive values')
+    targets = future_memory_v2_occupancy_targets(
+        points, points_mask, gt_tensor, pc_range,
+        voxel_size=voxel_size, empty_label=empty_label,
+        positive_radius=positive_radius)
+    positive = targets['positive']
+    valid = targets['valid']
+    labels = targets['labels']
+    occupancy_target = positive.to(dtype)
+    occupancy = occupancy_logits.squeeze(-1)
+    occupancy_bce = F.binary_cross_entropy_with_logits(
+        occupancy, occupancy_target, reduction='none')
+    occ_diagnostics = {}
+    if (occupancy_positive_class_balance_beta != 0. or
+            occupancy_class_balance_diagnostics):
+        loss_occ, occ_diagnostics = class_balanced_occupancy_bce(
+            occupancy_bce, positive, valid, labels, C,
+            beta=occupancy_positive_class_balance_beta,
+            positive_weight=occupancy_positive_weight,
+            negative_weight=occupancy_negative_weight,
+            voxel_positive=targets['voxel_positive'],
+            return_diagnostics=occupancy_class_balance_diagnostics)
+    else:
+        loss_occ = _balanced_binary_group_mean(
+            occupancy_bce, positive, valid,
+            positive_weight=occupancy_positive_weight,
+            negative_weight=occupancy_negative_weight)
+
+    if baseline_occupancy_logits is None:
+        loss_occ_anchor = occupancy_logits.sum() * 0.
+    else:
+        baseline_occupancy = torch.as_tensor(
+            baseline_occupancy_logits, device=device, dtype=dtype)
+        if baseline_occupancy.shape != expected_occupancy_shape:
+            raise ValueError(
+                'baseline_occupancy_logits must have shape '
+                f'{expected_occupancy_shape}, got '
+                f'{tuple(baseline_occupancy.shape)}')
+        anchor = F.smooth_l1_loss(
+            occupancy, baseline_occupancy.detach().squeeze(-1),
+            reduction='none')
+        loss_occ_anchor = (
+            (anchor * valid.to(dtype)).sum() /
+            valid.to(dtype).sum().clamp_min(1.))
+
+    converted_weights = prepare_class_weights(
+        class_weights, C, device, dtype)
+    if positive.any():
+        loss_sem = F.cross_entropy(
+            semantic_logits.reshape(-1, C)[positive.reshape(-1)],
+            labels.reshape(-1)[positive.reshape(-1)].clamp(0, C - 1),
+            weight=converted_weights)
+    else:
+        loss_sem = semantic_logits.sum() * 0.
+
+    score_thresholds = torch.as_tensor(
+        score_thresholds, device=device, dtype=dtype).flatten()
+    if score_thresholds.numel() == 0:
+        raise ValueError('score_thresholds cannot be empty')
+    if score_thresholds.numel() == 1:
+        score_thresholds = score_thresholds.expand(C)
+    if score_thresholds.numel() < C:
+        score_thresholds = F.pad(
+            score_thresholds, (0, C - score_thresholds.numel()),
+            value=float(score_thresholds[-1]))
+    score_thresholds = score_thresholds[:C].clamp(1e-4, 1 - 1e-4)
+    threshold_logits = torch.log(
+        score_thresholds / (1. - score_thresholds))
+    predicted_class = semantic_logits.argmax(-1)
+    target_class = torch.where(
+        positive, labels, predicted_class).clamp(0, C - 1)
+    boundary = threshold_logits[target_class]
+    per_point_threshold = torch.where(
+        positive,
+        F.softplus(boundary + float(threshold_margin) - occupancy),
+        F.softplus(occupancy - boundary + float(threshold_margin)))
+    loss_threshold = _balanced_binary_group_mean(
+        per_point_threshold, positive, valid,
+        positive_weight=threshold_positive_weight,
+        negative_weight=threshold_negative_weight)
+    loss_voxel = sparse_soft_voxel_iou_loss(
+        semantic_logits, occupancy_logits, points, gt_tensor,
+        points_mask=points_mask, pc_range=pc_range,
+        voxel_size=voxel_size, num_classes=C,
+        class_weights=converted_weights,
+        voxel_center_offset=soft_voxel_center_offset,
+        renormalize_valid_corners=soft_voxel_renormalize_valid_corners)
+    losses = dict(
+        loss_sem=loss_sem, loss_occ=loss_occ,
+        loss_occ_anchor=loss_occ_anchor,
+        loss_threshold=loss_threshold,
+        loss_soft_voxel=loss_voxel)
+    if occupancy_class_balance_diagnostics:
+        losses['occupancy_diagnostics'] = occ_diagnostics
+    return losses

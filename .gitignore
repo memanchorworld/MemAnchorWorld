@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.env.*
+data/
+work_dirs/
+checkpoints/
+*.pth
+*.pkl
+*.log
