@@ -2,9 +2,9 @@
 
 ## Overview
 
-MemAnchorWorld extends SparseWorld for future semantic occupancy forecasting.
+MemAnchorWorld forecasts future semantic occupancy from camera observations.
 It stores historical scene queries, retrieves memory anchors for each forecast
-horizon, and uses point-level residuals to correct semantic scores, occupancy
+horizon, and applies point-level corrections to semantic scores, occupancy
 confidence, and position.
 
 ## Getting Started
@@ -15,25 +15,17 @@ Use Linux x86-64 with an NVIDIA GPU, Python 3.9, a C/C++ toolchain, and the
 CUDA 11.8 Toolkit. The Toolkit provides `nvcc` for compiling CUDA operators.
 Install the matching PyTorch build before compiling extensions.
 
-1. Check out SparseWorld and copy in the MemAnchorWorld source files. Download
-   the MemAnchorWorld archive from this repository and set
-   `MEMANCHORWORLD_SRC` to the extracted directory containing
-   `configs/`, `mmdet3d/`, and `tools/`.
+Download and extract this repository, then run the commands below from its
+root directory.
 
-   ```bash
-   git clone https://github.com/MSunDYY/SparseWorld.git
-   cd SparseWorld
-   git checkout 14f5fe3bdd3428002d913988fbfd9b653a1a207e
-   MEMANCHORWORLD_SRC=/path/to/extracted/MemAnchorWorld
-   cp -a "$MEMANCHORWORLD_SRC"/{configs,mmdet3d,tools} .
-   ```
-
-2. Create the environment and select the CUDA Toolkit. Adjust `CUDA_HOME` to
-   your installation path.
+1. Create the environment and select the CUDA Toolkit. Adjust `CUDA_HOME` to
+   your installation path. The preparation command downloads the pinned runtime
+   files into the repository.
 
    ```bash
    python3.9 -m venv .venv
    source .venv/bin/activate
+   python tools/prepare_reproduction.py runtime
    export CUDA_HOME=/usr/local/cuda-11.8
    export PATH="$CUDA_HOME/bin:$PATH"
    nvidia-smi
@@ -43,7 +35,7 @@ Install the matching PyTorch build before compiling extensions.
      --index-url https://download.pytorch.org/whl/cu118
    ```
 
-3. Install the OpenMMLab stack and runtime dependencies. SparseWorld uses
+2. Install the OpenMMLab stack and runtime dependencies. The code uses
    MMCV 1.x APIs. The following commands build MMCV 1.7.0 against the installed
    PyTorch and install the CUDA 11.8 wheel for Torch Scatter.
 
@@ -62,8 +54,8 @@ Install the matching PyTorch build before compiling extensions.
      -f https://data.pyg.org/whl/torch-2.0.1+cu118.html
    ```
 
-4. Build the BEV pooling and multi-scale multi-view sampling operators. Run the
-   import check from the SparseWorld root directory.
+3. Build the BEV pooling and multi-scale multi-view sampling operators, then
+   run the import check from the repository root.
 
    ```bash
    FORCE_CUDA=1 python -m pip install -v --no-build-isolation --no-deps -e .
@@ -84,9 +76,8 @@ Install the matching PyTorch build before compiling extensions.
    PY
    ```
 
-See the [SparseWorld installation guide](https://github.com/MSunDYY/SparseWorld/blob/master/docs/install.md)
-and the [MMCV build guide](https://mmcv.readthedocs.io/en/1.x/get_started/build.html)
-for the corresponding upstream build steps.
+See the [MMCV build guide](https://mmcv.readthedocs.io/en/1.x/get_started/build.html)
+for details on compiling MMCV.
 
 ### Dataset and Memory Cache
 
@@ -94,14 +85,20 @@ Download nuScenes v1.0 trainval and the matching lidarseg data from
 [nuScenes](https://www.nuscenes.org/download). Extract them under
 `data/nuscenes/`. Add the nuScenes occupancy labels from
 [Occ3D](https://github.com/Tsinghua-MARS-Lab/Occ3D) as `data/nuscenes/gts/`.
-Download the two BEVDet metadata files, the `admlp` and `occworld` inputs, and
-`epoch_56.pth` from the
-[SparseWorld data and weights repository](https://huggingface.co/MSunDYY2001/SparseWorld/tree/main).
-Keep the paths below because the dataset loader and the metadata files refer to
-these locations.
+Use the following command to download the preprocessed metadata, the ego and
+trajectory inputs, and the initialization weights used to generate the memory
+cache. Files are checked against their published SHA-256 values. Use
+`--split val` to prepare only the validation inputs.
+
+```bash
+python tools/prepare_reproduction.py inputs --split both
+```
+
+The resulting layout is shown below. Keep these paths when placing the dataset
+files because the metadata contains relative paths.
 
 ```text
-SparseWorld/
+MemAnchorWorld/
 ├── ckpts/
 │   └── epoch_56.pth
 ├── data/
@@ -124,38 +121,38 @@ SparseWorld/
     └── nuscenes_infos_val_temporal_v3_scene.pkl
 ```
 
-Generate the observation-query caches from the SparseWorld checkpoint. Run both
+Generate the observation-query caches from the initialization checkpoint. Run both
 commands for training or only the validation command to run inference on the
 validation split.
 
 ```bash
-CACHE_CONFIG=configs/sparseworld/nuscenes-temporal/memanchorworld-query-memory.py
+CACHE_CONFIG=configs/memanchorworld/nuscenes-temporal/memanchorworld-query-memory.py
 
 python tools/query_memory/precompute_query_memory.py \
   --config "$CACHE_CONFIG" --checkpoint ckpts/epoch_56.pth --split train \
-  --output-dir data/query_memory/sparseworld_epoch56_schema2_train
+  --output-dir data/query_memory/observation_train
 
 python tools/query_memory/precompute_query_memory.py \
   --config "$CACHE_CONFIG" --checkpoint ckpts/epoch_56.pth --split val \
-  --output-dir data/query_memory/sparseworld_epoch56_schema2_val
+  --output-dir data/query_memory/observation_val
 ```
 
 The script writes one `<scene>/<sample>.pt` record for each processed sample.
 Use `--skip-existing` to continue an interrupted run with the same settings.
 If you store the caches elsewhere, set `query_memory_train_cache_root` and
 `query_memory_val_cache_root` in
-[`memanchorworld-query-memory.py`](configs/sparseworld/nuscenes-temporal/memanchorworld-query-memory.py).
+[`memanchorworld-query-memory.py`](configs/memanchorworld/nuscenes-temporal/memanchorworld-query-memory.py).
 
 ### Training and Inference
 
-From the SparseWorld root directory, run the following commands with local
-checkpoints. Training resumes from a compatible checkpoint containing the
-optimizer state. For validation, use a trained MemAnchorWorld checkpoint.
+From the repository root, run the following commands with checkpoints for the
+released configuration. Resuming training requires a checkpoint with the
+optimizer state. Validation requires a trained MemAnchorWorld checkpoint.
 The single-GPU validation command reports occupancy metrics and writes
 predicted trajectories to `admlp/output_data.pkl`.
 
 ```bash
-CONFIG=configs/sparseworld/nuscenes-temporal/memanchorworld-r50.py
+CONFIG=configs/memanchorworld/nuscenes-temporal/memanchorworld-r50.py
 python tools/train.py "$CONFIG" --resume-from /path/to/resume_checkpoint.pth
 python tools/test_temporal.py "$CONFIG" /path/to/model_checkpoint.pth --eval segm
 ```
@@ -164,9 +161,10 @@ python tools/test_temporal.py "$CONFIG" /path/to/model_checkpoint.pth --eval seg
 
 | Model | Configuration |
 | --- | --- |
-| MemAnchorWorld with ResNet-50 | [memanchorworld-r50.py](configs/sparseworld/nuscenes-temporal/memanchorworld-r50.py) |
+| MemAnchorWorld with ResNet-50 | [memanchorworld-r50.py](configs/memanchorworld/nuscenes-temporal/memanchorworld-r50.py) |
 
 ## Acknowledgments
 
-This implementation builds on [SparseWorld](https://github.com/MSunDYY/SparseWorld)
-and the OpenMMLab ecosystem.
+We thank the [SparseWorld](https://github.com/MSunDYY/SparseWorld) authors for
+releasing the runtime sources and [public inputs](https://huggingface.co/MSunDYY2001/SparseWorld/tree/main),
+and the OpenMMLab community for its libraries.

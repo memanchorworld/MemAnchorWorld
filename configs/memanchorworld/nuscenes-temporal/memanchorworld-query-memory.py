@@ -61,9 +61,9 @@ occ_names = [
 
 embed_dims = 256
 query_memory_train_cache_root = (
-    './data/query_memory/sparseworld_epoch56_schema2_train')
+    './data/query_memory/observation_train')
 query_memory_val_cache_root = (
-    './data/query_memory/sparseworld_epoch56_schema2_val')
+    './data/query_memory/observation_val')
 query_memory_history_frames = 3
 query_memory_max_queries_per_frame = 256
 query_memory_write_threshold = 0.35
