@@ -1,11 +1,7 @@
-"""Future Memory Adapter V2 code-level build and test configuration.
-
-The inherited V1 configuration is intentionally untouched so its checkpoints
-remain reproducible.  This file selects only the new point-level adapter; it
-is not a formal training or validation launcher.
+"""Point-level memory adapter with geometric and semantic retrieval.
 """
 
-_base_ = ['./sparseworld-traj-memory-future-adapter.py']
+_base_ = ['./memanchorworld-query-adapter.py']
 
 future_memory_adapter_version = 'v2'
 future_memory_target_horizons = [1.0, 2.0, 3.0]
@@ -25,9 +21,7 @@ future_memory_adapter_v2 = dict(
     semantic_uncertainty_gamma=2.0,
     semantic_weight_floor=0.10,
     semantic_dropout_probability=0.10,
-    # 40 is the validated compromise on the available 24 GB GPUs: it
-    # reduces Python chunk-loop overhead versus q32 while retaining enough
-    # headroom for the frozen Baseline activations.
+    # Process point attention in chunks to limit activation memory.
     query_chunk_size=40,
     # Recompute V2 during backward rather than retaining three horizons of
     # point-attention activations. Full CPU offload is disabled because the
@@ -43,10 +37,7 @@ future_memory_adapter_v2 = dict(
     dropout=0.0,
     voxel_size=(0.4, 0.4, 0.4),
     loss_occ_weight=0.25,
-    # Keep occupancy corrections close to the frozen Baseline unless the new
-    # voxel-aligned supervision provides evidence for a change.  This guards
-    # against a global future-recall collapse while leaving residual learning
-    # active.
+    # Anchor occupancy corrections to the frozen backbone predictions.
     loss_occ_anchor_weight=0.05,
     loss_sem_weight=0.25,
     loss_threshold_weight=0.10,
@@ -75,14 +66,14 @@ model = dict(
         future_memory_adapter_finetune_mode=True,
         future_memory_target_horizons=future_memory_target_horizons,
         future_memory_adapter_v2=future_memory_adapter_v2,
-        # V1 and all legacy routes remain disabled by this independent config.
+        # Disable query-memory fusion and the separate refiner.
         enabled=False,
         memory_conditioned_refiner=False,
         memory_finetune_mode=False,
         memory_joint_finetune_mode=False,
-        memory_phase2_finetune_mode=False,
-        memory_phase3_finetune_mode=False,
-        memory_phase3_future_only=False,
+        memory_joint_head_finetune_mode=False,
+        memory_refiner_finetune_mode=False,
+        memory_refiner_future_only=False,
     ),
 )
 

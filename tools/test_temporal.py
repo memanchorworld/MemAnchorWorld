@@ -316,7 +316,7 @@ def main():
         kwargs = {} if args.eval_options is None else args.eval_optionsz
         if args.eval:
             eval_kwargs = cfg.get('evaluation', {}).copy()
-            # hard-code way to remove EvalHook args
+            # Remove hook settings before calling the dataset.
             for key in [
                     'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
                     'rule'

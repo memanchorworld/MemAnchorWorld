@@ -1,27 +1,50 @@
-# MemAnchorWorld
+# MemAnchorWorld: A Sparse World Model with Horizon-Conditioned Memory Retrieval for Autonomous Driving
 
-Core implementation of historical memory-anchor retrieval and task- and
-horizon-gated point-level residual adaptation for sparse 4D semantic occupancy
-forecasting.
+## Overview
 
-## Core modules
+MemAnchorWorld extends SparseWorld for future semantic occupancy forecasting.
+It stores historical scene queries, retrieves memory anchors for each forecast
+horizon, and uses point-level residuals to correct semantic scores, occupancy
+confidence, and position.
 
-- `mmdet3d/models/sparsedetectors/query_memory.py` implements memory storage,
-  alignment, retrieval, gated residual adaptation, and point/voxel supervision.
-- `mmdet3d/models/sparsedetectors/sparseworld_4d_traj.py` integrates the modules
-  with recurrent occupancy forecasting and trajectory planning.
-- `mmdet3d/datasets/pipelines/loading_query_memory.py` loads historical queries.
-- `tools/query_memory/precompute_query_memory.py` builds observation-query caches.
-- `configs/` contains the selected model configuration and its base configurations.
+## Getting Started
 
-## Integration
+### Installation
 
-The files retain their original SparseWorld/OpenMMLab package paths. Integrate
-them into the corresponding forecasting codebase, retaining its existing
-backbone, operators, and dependencies. Dataset locations, memory-cache paths,
-and checkpoint paths are configured for the local environment.
+Set up [SparseWorld](https://github.com/MSunDYY/SparseWorld) using its
+[installation guide](https://github.com/MSunDYY/SparseWorld/blob/master/docs/install.md).
+Copy the files in this repository into the corresponding paths in the SparseWorld
+checkout. The code uses SparseWorld's backbone, operators, and dependencies.
 
-The selected configuration is
-`configs/sparseworld/nuscenes-temporal/sparseworld-traj-memory-future-adapter-v2-ab-softvoxel-center-t1.py`.
-Training and evaluation entry points are `tools/train.py`, `tools/test.py`, and
-`tools/test_temporal.py`.
+### Dataset and Memory Cache
+
+Follow the SparseWorld
+[dataset preparation guide](https://github.com/MSunDYY/SparseWorld/blob/master/docs/prepare_datasets.md)
+for nuScenes, Occ3D, and the preprocessed inputs. Use
+[`tools/query_memory/precompute_query_memory.py`](tools/query_memory/precompute_query_memory.py)
+to build the observation-query caches with a SparseWorld checkpoint. Set the
+dataset and cache paths in the configuration and its inherited files.
+
+### Training and Inference
+
+Run the commands from the SparseWorld checkout after integrating the MemAnchorWorld
+files. Replace the example paths with your local checkpoints. Training resumes
+from a compatible checkpoint that includes the optimizer state.
+
+```bash
+CONFIG=configs/sparseworld/nuscenes-temporal/memanchorworld-r50.py
+python tools/train.py "$CONFIG" --resume-from /path/to/resume_checkpoint.pth
+torchrun --nproc_per_node=1 tools/test_temporal.py "$CONFIG" /path/to/model_checkpoint.pth \
+  --launcher pytorch --dump_dir predictions --dump-only
+```
+
+## Configuration
+
+| Model | Configuration |
+| --- | --- |
+| MemAnchorWorld with ResNet-50 | [memanchorworld-r50.py](configs/sparseworld/nuscenes-temporal/memanchorworld-r50.py) |
+
+## Acknowledgments
+
+This implementation builds on [SparseWorld](https://github.com/MSunDYY/SparseWorld)
+and the OpenMMLab ecosystem.

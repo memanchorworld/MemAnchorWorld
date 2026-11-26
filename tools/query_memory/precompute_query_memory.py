@@ -12,7 +12,7 @@ from mmdet3d.models.sparsedetectors.query_memory import (
     compute_query_reliability, select_diverse_memory_queries)
 
 
-# Schema v2 (Problem 4/5): adds per-query semantic reliability + label so the
+# Schema v2: adds per-query semantic reliability + label so the
 # loader / online bank can run reliability-aware attention and class-diverse
 # selection. query_conf is retained for schema-v1 backward compatibility.
 CACHE_SCHEMA_VERSION = 2

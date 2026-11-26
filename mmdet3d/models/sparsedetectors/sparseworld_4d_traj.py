@@ -54,9 +54,8 @@ def Scatter(src_dict):
 class MemoryConditionedRefiner(nn.Module):
     """Shared feature refiner used by current and future occupancy paths.
 
-    The position input is metric-space Query center coordinates.  A small
-    fixed residual scale keeps the new branch conservative at initialization
-    while leaving a live gradient path through every refiner layer.
+    The position input contains query centers in metric coordinates. The
+    fixed residual scale preserves gradients through the refiner.
     """
 
     def __init__(self, embed_dims, residual_scale=0.1):
@@ -112,15 +111,15 @@ class SparseWorld4DTraj(OPUS):
         'cls_branch',
         'ego_cross_attn',
     )
-    _MEMORY_PHASE2_TRAINABLE_PREFIXES = (
+    _MEMORY_JOINT_HEAD_TRAINABLE_PREFIXES = (
         *_MEMORY_JOINT_TRAINABLE_PREFIXES,
         'pts_bbox_head.',
     )
-    _MEMORY_PHASE2_TRAIN_MODULES = (
+    _MEMORY_JOINT_HEAD_TRAIN_MODULES = (
         *_MEMORY_JOINT_TRAIN_MODULES,
         'pts_bbox_head',
     )
-    _MEMORY_PHASE3_TRAINABLE_PREFIXES = (
+    _MEMORY_REFINER_TRAINABLE_PREFIXES = (
         'query_memory.',
         'memory_refiner.',
         'memory_cls_branch.',
@@ -128,7 +127,7 @@ class SparseWorld4DTraj(OPUS):
         'memory_vel_branch.',
         'memory_horizon_embedding.',
     )
-    _MEMORY_PHASE3_TRAIN_MODULES = (
+    _MEMORY_REFINER_TRAIN_MODULES = (
         'query_memory',
         'memory_refiner',
         'memory_cls_branch',
@@ -136,7 +135,7 @@ class SparseWorld4DTraj(OPUS):
         'memory_vel_branch',
         'memory_horizon_embedding',
     )
-    # The repaired future-only topology has one auditable trainable prefix.
+    # The output adapter is the only trainable module in this mode.
     # Every original OPUS/image/trajectory parameter is frozen in this mode.
     _FUTURE_MEMORY_TRAINABLE_PREFIXES = ('future_memory_adapter.',)
     _FUTURE_MEMORY_TRAIN_MODULES = ('future_memory_adapter',)
@@ -289,31 +288,30 @@ class SparseWorld4DTraj(OPUS):
         if future_memory_adapter_version is not None:
             self.query_memory_cfg['future_memory_adapter_version'] = str(
                 future_memory_adapter_version)
-        memory_ablation = self.query_memory_cfg.get(
-            'memory_ablation_memory_enabled', None)
-        refiner_ablation = self.query_memory_cfg.get(
-            'memory_ablation_refiner_enabled', None)
-        self.memory_ablation_memory_enabled = memory_ablation
-        self.memory_ablation_refiner_enabled = refiner_ablation
+        memory_override = self.query_memory_cfg.get(
+            'memory_execution_override', None)
+        refiner_override = self.query_memory_cfg.get(
+            'memory_refiner_execution_override', None)
+        self.memory_execution_override = memory_override
+        self.memory_refiner_execution_override = refiner_override
         configured_memory_enabled = bool(
             self.query_memory_cfg.get('enabled', False))
         self.query_memory_enabled = (
-            configured_memory_enabled if memory_ablation is None else
-            bool(memory_ablation))
-        # Keep the module topology (and therefore deterministic initialization
-        # order) identical across M=OFF/M=ON cells.  M=OFF is an execution
-        # bypass; its STAC-QM parameters remain frozen and outside optimizer.
+            configured_memory_enabled if memory_override is None else
+            bool(memory_override))
+        # Preserve module construction and initialization order when execution
+        # is disabled. The bypassed query-memory parameters stay frozen.
         self.query_memory_module_enabled = bool(
-            configured_memory_enabled or memory_ablation is not None)
+            configured_memory_enabled or memory_override is not None)
         self.memory_enabled = self.query_memory_enabled
         self.memory_finetune_mode = bool(
             self.query_memory_cfg.get('memory_finetune_mode', False))
         self.memory_joint_finetune_mode = bool(
             self.query_memory_cfg.get('memory_joint_finetune_mode', False))
-        self.memory_phase2_finetune_mode = bool(
-            self.query_memory_cfg.get('memory_phase2_finetune_mode', False))
-        self.memory_phase3_finetune_mode = bool(
-            self.query_memory_cfg.get('memory_phase3_finetune_mode', False))
+        self.memory_joint_head_finetune_mode = bool(
+            self.query_memory_cfg.get('memory_joint_head_finetune_mode', False))
+        self.memory_refiner_finetune_mode = bool(
+            self.query_memory_cfg.get('memory_refiner_finetune_mode', False))
         future_adapter_cfg = self.query_memory_cfg.get(
             'future_memory_adapter', None)
         future_adapter_v2_cfg = self.query_memory_cfg.get(
@@ -353,29 +351,28 @@ class SparseWorld4DTraj(OPUS):
         refiner_cfg = self.query_memory_cfg.get(
             'memory_conditioned_refiner', None)
         configured_refiner_enabled = (
-            self.memory_phase3_finetune_mode
+            self.memory_refiner_finetune_mode
             if refiner_cfg is None else bool(refiner_cfg))
         self.memory_conditioned_refiner_enabled = (
-            configured_refiner_enabled if refiner_ablation is None else
-            bool(refiner_ablation))
-        self.memory_phase3_base_aux_weight = float(
-            self.query_memory_cfg.get('memory_phase3_base_aux_weight', 0.25))
+            configured_refiner_enabled if refiner_override is None else
+            bool(refiner_override))
+        self.memory_refiner_base_aux_weight = float(
+            self.query_memory_cfg.get('memory_refiner_base_aux_weight', 0.25))
         # Keep the raw OPUS observation Query for 0s while allowing STAC-QM
         # and the Memory-conditioned refiner to affect only scheduled future
-        # Query groups.  This isolates future benefit from the harmful 0s
-        # route observed in the first formal Phase 3 run.
-        self.memory_phase3_future_only = bool(
-            self.query_memory_cfg.get('memory_phase3_future_only', False))
+        # query groups.
+        self.memory_refiner_future_only = bool(
+            self.query_memory_cfg.get('memory_refiner_future_only', False))
         if sum((self.future_memory_adapter_finetune_mode,
                 self.memory_finetune_mode,
                 self.memory_joint_finetune_mode,
-                self.memory_phase2_finetune_mode,
-                self.memory_phase3_finetune_mode)) > 1:
+                self.memory_joint_head_finetune_mode,
+                self.memory_refiner_finetune_mode)) > 1:
             raise ValueError(
                 'future_memory_adapter_finetune_mode, memory_finetune_mode, '
                 'memory_joint_finetune_mode, '
-                'memory_phase2_finetune_mode, and '
-                'memory_phase3_finetune_mode are mutually exclusive')
+                'memory_joint_head_finetune_mode, and '
+                'memory_refiner_finetune_mode are mutually exclusive')
         self.query_memory_source = self.query_memory_cfg.get('source', 'cache')
         self.query_memory_frame_interval = float(
             self.query_memory_cfg.get('frame_interval', 0.5))
@@ -449,9 +446,8 @@ class SparseWorld4DTraj(OPUS):
                     max_per_class=self.query_memory_cfg.get(
                         'max_per_class', 64))
 
-        # Do not route the repaired adapter through STACQueryMemory or the
-        # legacy MemoryConditionedRefiner.  It is an independent output-only
-        # correction stream and is instantiated only by the dedicated config.
+        # The output adapter applies corrections independently of the
+        # query-memory fusion and MemoryConditionedRefiner.
         if getattr(self, 'future_memory_adapter_enabled', False):
             if self.future_memory_adapter_version == 'v2':
                 adapter_cfg = dict(future_adapter_v2_cfg or future_adapter_cfg or {})
@@ -553,7 +549,7 @@ class SparseWorld4DTraj(OPUS):
     def _forward_backbone_future_memory_adapter(
             self, img_metas, kwargs, B, ego_feat, outs, query_feat,
             query_pos, query_cls, ind_stamps_all, memory_context):
-        """Run the repaired output-only FutureMemoryAdapter topology.
+        """Run the FutureMemoryAdapter on the forecast outputs.
 
         ``state_*`` tensors below are the unmodified OPUS baseline stream.  A
         target-horizon adapter is evaluated from a snapshot of that stream and
@@ -945,7 +941,7 @@ class SparseWorld4DTraj(OPUS):
         cfg = dict(
             enabled=False,
             source='cache',
-            # --- history selection (Problem 6) ---
+            # --- history selection ---
             history_selection_mode='target_age',
             history_frames=3,
             history_target_ages=[2.5, 3.5, 4.5],
@@ -954,7 +950,7 @@ class SparseWorld4DTraj(OPUS):
             retention_seconds=5.0,
             max_bank_entries=16,
             frame_interval=0.5,
-            # --- diversity selection (Problem 5) ---
+            # --- diversity selection ---
             max_queries_per_frame=256,
             min_reliability=0.0,
             spatial_cell_size=4.0,
@@ -973,7 +969,7 @@ class SparseWorld4DTraj(OPUS):
             # kept for the CausalQueryMemoryAttention legacy alias
             lambda_confidence=1.0,
             dropout=0.0,
-            # --- motion compensation (Problem 3) ---
+            # --- motion compensation ---
             motion_compensation=True,
             max_velocity=20.0,
             # --- misc ---
@@ -983,20 +979,19 @@ class SparseWorld4DTraj(OPUS):
             freeze_base_model=False,
             memory_finetune_mode=False,
             memory_joint_finetune_mode=False,
-            memory_phase2_finetune_mode=False,
-            memory_phase3_finetune_mode=False,
+            memory_joint_head_finetune_mode=False,
+            memory_refiner_finetune_mode=False,
             future_memory_adapter_enabled=False,
             future_memory_adapter_finetune_mode=False,
             future_memory_target_horizons=(1.0, 2.0, 3.0),
             future_memory_adapter=None,
             memory_conditioned_refiner=None,
-            memory_phase3_base_aux_weight=0.25,
-            memory_phase3_future_only=False,
-            # Explicit 2x2 ablation switches. ``None`` preserves the legacy
-            # mode-derived behavior; bool values override Memory/refiner
-            # independently while keeping the same future-only routing.
-            memory_ablation_memory_enabled=None,
-            memory_ablation_refiner_enabled=None,
+            memory_refiner_base_aux_weight=0.25,
+            memory_refiner_future_only=False,
+            # Optional execution overrides for query memory and the refiner.
+            # A value of ``None`` uses the behavior of the selected tuning mode.
+            memory_execution_override=None,
+            memory_refiner_execution_override=None,
             fusion_gate_bias=-4.0,
             fusion_alpha_init=0.0,
             fusion_out_proj_gain=0.0,
@@ -1036,15 +1031,15 @@ class SparseWorld4DTraj(OPUS):
             getattr(self, 'future_memory_adapter_finetune_mode', False) or
             getattr(self, 'memory_finetune_mode', False) or
             getattr(self, 'memory_joint_finetune_mode', False) or
-            getattr(self, 'memory_phase2_finetune_mode', False) or
-            getattr(self, 'memory_phase3_finetune_mode', False))
+            getattr(self, 'memory_joint_head_finetune_mode', False) or
+            getattr(self, 'memory_refiner_finetune_mode', False))
 
     def memory_tuning_trainable_prefixes(self):
         if getattr(self, 'future_memory_adapter_finetune_mode', False):
             if getattr(self, 'future_memory_adapter_version', 'v1') == 'v2':
                 return self._FUTURE_MEMORY_V2_TRAINABLE_PREFIXES
             return self._FUTURE_MEMORY_TRAINABLE_PREFIXES
-        if getattr(self, 'memory_phase3_finetune_mode', False):
+        if getattr(self, 'memory_refiner_finetune_mode', False):
             prefixes = []
             if getattr(self, 'query_memory_enabled', False):
                 prefixes.append('query_memory.')
@@ -1057,8 +1052,8 @@ class SparseWorld4DTraj(OPUS):
                     'memory_horizon_embedding.',
                 ))
             return tuple(prefixes)
-        if getattr(self, 'memory_phase2_finetune_mode', False):
-            return self._MEMORY_PHASE2_TRAINABLE_PREFIXES
+        if getattr(self, 'memory_joint_head_finetune_mode', False):
+            return self._MEMORY_JOINT_HEAD_TRAINABLE_PREFIXES
         if getattr(self, 'memory_joint_finetune_mode', False):
             return self._MEMORY_JOINT_TRAINABLE_PREFIXES
         if getattr(self, 'memory_finetune_mode', False) or \
@@ -1071,7 +1066,7 @@ class SparseWorld4DTraj(OPUS):
             if getattr(self, 'future_memory_adapter_version', 'v1') == 'v2':
                 return self._FUTURE_MEMORY_V2_TRAIN_MODULES
             return self._FUTURE_MEMORY_TRAIN_MODULES
-        if getattr(self, 'memory_phase3_finetune_mode', False):
+        if getattr(self, 'memory_refiner_finetune_mode', False):
             modules = []
             if getattr(self, 'query_memory_enabled', False):
                 modules.append('query_memory')
@@ -1084,8 +1079,8 @@ class SparseWorld4DTraj(OPUS):
                     'memory_horizon_embedding',
                 ))
             return tuple(modules)
-        if getattr(self, 'memory_phase2_finetune_mode', False):
-            return self._MEMORY_PHASE2_TRAIN_MODULES
+        if getattr(self, 'memory_joint_head_finetune_mode', False):
+            return self._MEMORY_JOINT_HEAD_TRAIN_MODULES
         if getattr(self, 'memory_joint_finetune_mode', False):
             return self._MEMORY_JOINT_TRAIN_MODULES
         if getattr(self, 'memory_finetune_mode', False):
@@ -1105,22 +1100,22 @@ class SparseWorld4DTraj(OPUS):
             getattr(self, 'future_memory_adapter_finetune_mode', False),
             getattr(self, 'memory_finetune_mode', False),
             getattr(self, 'memory_joint_finetune_mode', False),
-            getattr(self, 'memory_phase2_finetune_mode', False),
-            getattr(self, 'memory_phase3_finetune_mode', False),
+            getattr(self, 'memory_joint_head_finetune_mode', False),
+            getattr(self, 'memory_refiner_finetune_mode', False),
         )
         if sum(tuning_modes) > 1:
             raise ValueError(
                 'future_memory_adapter_finetune_mode, memory_finetune_mode, '
                 'memory_joint_finetune_mode, '
-                'memory_phase2_finetune_mode, and '
-                'memory_phase3_finetune_mode are mutually exclusive')
+                'memory_joint_head_finetune_mode, and '
+                'memory_refiner_finetune_mode are mutually exclusive')
         if self._memory_tuning_active():
             if getattr(self, 'future_memory_adapter_finetune_mode', False):
                 mode_name = 'future_memory_adapter_finetune_mode'
-            elif getattr(self, 'memory_phase3_finetune_mode', False):
-                mode_name = 'memory_phase3_finetune_mode'
-            elif getattr(self, 'memory_phase2_finetune_mode', False):
-                mode_name = 'memory_phase2_finetune_mode'
+            elif getattr(self, 'memory_refiner_finetune_mode', False):
+                mode_name = 'memory_refiner_finetune_mode'
+            elif getattr(self, 'memory_joint_head_finetune_mode', False):
+                mode_name = 'memory_joint_head_finetune_mode'
             elif getattr(self, 'memory_joint_finetune_mode', False):
                 mode_name = 'memory_joint_finetune_mode'
             else:
@@ -1138,14 +1133,14 @@ class SparseWorld4DTraj(OPUS):
                     raise ValueError(
                         'future_memory_adapter_finetune_mode=True requires '
                         'source="cache"')
-            elif (getattr(self, 'memory_phase3_finetune_mode', False) and
+            elif (getattr(self, 'memory_refiner_finetune_mode', False) and
                     not self.query_memory_enabled and
                     not self.memory_conditioned_refiner_enabled):
                 raise ValueError(
-                    'memory_phase3_finetune_mode requires at least one of '
+                    'memory_refiner_finetune_mode requires at least one of '
                     'Memory or refiner to be enabled')
             if (not getattr(self, 'future_memory_adapter_finetune_mode', False) and
-                    not getattr(self, 'memory_phase3_finetune_mode', False) and
+                    not getattr(self, 'memory_refiner_finetune_mode', False) and
                     (not self.query_memory_enabled or
                      self.query_memory is None)):
                 raise ValueError(
@@ -1492,7 +1487,7 @@ class SparseWorld4DTraj(OPUS):
                     kwargs, 'memory_source_ego2global', device, torch.float32),
                 memory_age=self._tensor_from_memory_kwargs(
                     kwargs, 'memory_age', device, torch.float32))
-            # schema-v2 optional fields (Problem 4). Absent for v1 caches, in
+            # schema-v2 optional fields. Absent for v1 caches, in
             # which case STAC-QM falls back to memory_conf as reliability.
             if 'memory_reliability' in kwargs:
                 context['memory_reliability'] = self._tensor_from_memory_kwargs(
@@ -1690,7 +1685,7 @@ class SparseWorld4DTraj(OPUS):
         curr_query_cls_for_memory = curr_query_cls
 
         if getattr(self, 'future_memory_adapter_enabled', False):
-            # The repaired adapter has its own cache read and output-only
+            # The adapter has its own cache read and output-only
             # correction stream.  It never enters the legacy STAC/refiner
             # path below, so baseline recurrence remains byte-for-byte in
             # terms of state topology.
@@ -1737,13 +1732,10 @@ class SparseWorld4DTraj(OPUS):
         else:
             memory_context = None
 
-        # Problem 1 (single-read) + Problem 2 (future-aware age):
-        # the observation queries read history memory EXACTLY ONCE, before the
-        # SCF recursion, at effective_age = base_age + 0. Already-fused active
-        # queries are never re-read inside the loop.  The future-only Phase 4
-        # variant intentionally skips this observation read/refiner so that
-        # the 0s output remains the raw OPUS baseline path.
-        if getattr(self, 'memory_phase3_future_only', False):
+        # Observation queries read memory before SCF at their base age.
+        # When refinement applies only to future queries, the 0s output
+        # comes directly from OPUS.
+        if getattr(self, 'memory_refiner_future_only', False):
             curr_query_memory_vel_offset = curr_query_feat.new_zeros(
                 B, curr_query_feat.shape[1], self.num_refines, 2)
             refiner_diag = dict(
@@ -1781,10 +1773,8 @@ class SparseWorld4DTraj(OPUS):
             num_fu_frames = self.num_fu_frames
 
         for interval in range(num_fu_frames):
-            # NOTE: the observation queries were already fused ONCE before this
-            # loop and are NOT re-read here (Problem 1). Only the scheduled
-            # future-query group added this step reads memory, and it does so
-            # exactly once (below), with its own future_offset (Problem 2).
+            # Each newly scheduled query group reads memory once, using its
+            # forecast offset to compute the effective age.
             fused_ego_feat,_ = self.ego_cross_attn(ego_feat.new_ones(B, 1, 3)*0.5, ego_feat, curr_query_pos.detach(),
                                                     curr_query_feat.detach(), )
             pred_traj = self.traj_head(fused_ego_feat)
@@ -1964,14 +1954,13 @@ class SparseWorld4DTraj(OPUS):
             loss_inputs = [voxel_semantics, temporal_semantics, temporal2ego, outs]
             losses.update(self.pts_bbox_head.loss_pretrain(*loss_inputs))
         else:
-            # Keep the original OPUS path as a scaled auxiliary objective in
-            # Phase 3.  The primary current occupancy loss below is routed
-            # through the Memory-conditioned refined outputs.
+            # The OPUS outputs receive a scaled auxiliary loss. The primary
+            # occupancy loss uses the refiner outputs.
             loss_inputs = [voxel_semantics, temporal_semantics, temporal2ego, outs]
             raw_aux_losses = self.pts_bbox_head.loss_pretrain(*loss_inputs)
             if self._memory_refiner_active():
                 raw_aux_losses = {
-                    key: value * self.memory_phase3_base_aux_weight
+                    key: value * self.memory_refiner_base_aux_weight
                     for key, value in raw_aux_losses.items()}
             losses.update(raw_aux_losses)
             if self._memory_refiner_active():
@@ -1999,7 +1988,7 @@ class SparseWorld4DTraj(OPUS):
         num_fu_frames = len(forecast_semantics_list)
         if self.future_memory_adapter_enabled:
             # Only target horizons receive corrected-output supervision.  The
-            # existing validated matching loss is reused one horizon at a
+            # existing matching loss is reused one horizon at a
             # time, then names are made explicit to avoid confusing internal
             # 0.5 s step numbers with evaluation horizons.
             for step_index, horizon_name in ((1, '1s'), (3, '2s'),

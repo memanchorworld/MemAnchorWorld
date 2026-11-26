@@ -69,7 +69,7 @@ query_memory_max_queries_per_frame = 256
 query_memory_write_threshold = 0.35
 query_memory_embed_dims = embed_dims
 query_memory_num_heads = 8
-# STAC-QM modeling-repair configuration (Problems 2/3/5/6).
+# Query-memory history and capacity settings.
 query_memory_frame_interval = 0.5
 query_memory_history_selection_mode = 'target_age'
 query_memory_history_target_ages = [2.5, 3.5, 4.5]
@@ -133,9 +133,9 @@ model = dict(
     query_memory_cfg=dict(
         enabled=True,
         source='cache',
-        # --- future-aware age (Problem 2) ---
+        # --- future-aware age ---
         frame_interval=query_memory_frame_interval,
-        # --- history selection (Problem 6) ---
+        # --- history selection ---
         history_selection_mode=query_memory_history_selection_mode,
         history_frames=query_memory_history_frames,
         history_target_ages=query_memory_history_target_ages,
@@ -143,7 +143,7 @@ model = dict(
         visual_history_window=query_memory_visual_history_window,
         retention_seconds=query_memory_retention_seconds,
         max_bank_entries=query_memory_max_bank_entries,
-        # --- diversity selection (Problem 5) ---
+        # --- diversity selection ---
         max_queries_per_frame=query_memory_max_queries_per_frame,
         write_threshold=query_memory_write_threshold,
         min_reliability=query_memory_min_reliability,
@@ -160,7 +160,7 @@ model = dict(
         lambda_time=1.0,
         lambda_reliability=1.0,
         dropout=0.0,
-        # --- motion compensation (Problem 3) ---
+        # --- motion compensation ---
         motion_compensation=True,
         max_velocity=20.0,
         # --- misc ---

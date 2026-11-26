@@ -22,7 +22,7 @@ def _tensor_digest(named_tensors):
 
 @HOOKS.register_module()
 class QueryMemoryConnectivityOptimizerHook(OptimizerHook):
-    """Optimizer hook for guarded STAC-QM Memory-only smoke training.
+    """Optimizer hook for guarded STAC-QM query-memory tuning.
 
     It performs the normal zero-grad/backward/clip/step sequence while checking
     that only query-memory parameters receive gradients, the restored TASS state
@@ -165,8 +165,7 @@ class QueryMemoryConnectivityOptimizerHook(OptimizerHook):
         if not self._ever_nonzero['motion_last']:
             runner.logger.warning(
                 'STAC-QM motion compensator final layer still has zero gradient '
-                'at connectivity check; inspect motion candidates before the '
-                'formal run.')
+                'at the connectivity check. Inspect the motion candidates.')
         self._connectivity_checked = True
 
     def after_train_iter(self, runner):
@@ -220,10 +219,10 @@ class QueryMemoryConnectivityOptimizerHook(OptimizerHook):
             if not name.startswith('query_memory.')
         ])
         if parameter_digest != self._base_parameter_digest:
-            raise RuntimeError('Frozen base parameters changed during smoke run')
+            raise RuntimeError('Frozen base parameters changed during training')
         if buffer_digest != self._base_buffer_digest:
             raise RuntimeError(
-                'Frozen base buffers/BN statistics changed during smoke run')
+                'Frozen base buffers/BN statistics changed during training')
         if not self._connectivity_checked:
             self._check_connectivity(runner)
 
@@ -307,7 +306,7 @@ class QueryMemoryJointConnectivityOptimizerHook(
             runner.logger.warning(
                 'STAC-QM motion compensator final layer still has zero gradient '
                 f'at {self._RUN_LABEL} connectivity check; inspect motion '
-                'candidates before the formal run.')
+                'candidates.')
         self._connectivity_checked = True
 
     def after_run(self, runner):
@@ -323,25 +322,24 @@ class QueryMemoryJointConnectivityOptimizerHook(
         ])
         if parameter_digest != self._base_parameter_digest:
             raise RuntimeError(
-                f'Frozen parameters changed during {self._RUN_LABEL} smoke '
-                'run')
+                f'Frozen parameters changed during {self._RUN_LABEL}')
         if buffer_digest != self._base_buffer_digest:
             raise RuntimeError(
                 'Frozen buffers/BN statistics changed during '
-                f'{self._RUN_LABEL} smoke run')
+                f'{self._RUN_LABEL} training')
         if not self._connectivity_checked:
             self._check_connectivity(runner)
 
 
 @HOOKS.register_module()
-class QueryMemoryPhase2ConnectivityOptimizerHook(
+class QueryMemoryJointHeadConnectivityOptimizerHook(
         QueryMemoryJointConnectivityOptimizerHook):
-    """Connectivity and frozen-state guard for phase2 STAC-QM tuning."""
+    """Connectivity and frozen-state guard for joint tuning with the detection head."""
 
-    _MODE_ATTRIBUTE = 'memory_phase2_finetune_mode'
-    _MODE_NAME = 'memory_phase2_finetune_mode'
-    _CONNECTIVITY_LABEL = 'Phase2 STAC-QM'
-    _RUN_LABEL = 'phase2'
+    _MODE_ATTRIBUTE = 'memory_joint_head_finetune_mode'
+    _MODE_NAME = 'memory_joint_head_finetune_mode'
+    _CONNECTIVITY_LABEL = 'Joint head and query memory'
+    _RUN_LABEL = 'joint head tuning'
     _GRAD_GROUPS = {
         **QueryMemoryJointConnectivityOptimizerHook._GRAD_GROUPS,
         'pts_bbox_head': ('pts_bbox_head.',),
@@ -353,14 +351,14 @@ class QueryMemoryPhase2ConnectivityOptimizerHook(
 
 
 @HOOKS.register_module()
-class QueryMemoryPhase3ConnectivityOptimizerHook(
+class QueryMemoryRefinerConnectivityOptimizerHook(
         QueryMemoryJointConnectivityOptimizerHook):
     """Connectivity guard for the Memory-conditioned occupancy refiner."""
 
-    _MODE_ATTRIBUTE = 'memory_phase3_finetune_mode'
-    _MODE_NAME = 'memory_phase3_finetune_mode'
-    _CONNECTIVITY_LABEL = 'Phase3 STAC-QM'
-    _RUN_LABEL = 'phase3'
+    _MODE_ATTRIBUTE = 'memory_refiner_finetune_mode'
+    _MODE_NAME = 'memory_refiner_finetune_mode'
+    _CONNECTIVITY_LABEL = 'Memory-conditioned refiner'
+    _RUN_LABEL = 'refiner tuning'
     _GRAD_GROUPS = {
         'fusion_out': ('query_memory.fusion.out_proj.',),
         'fusion_gate': ('query_memory.fusion.gate_mlp.',),
@@ -382,12 +380,7 @@ class QueryMemoryPhase3ConnectivityOptimizerHook(
         'memory_horizon_embedding')
 
     def _required_grad_groups(self, model):
-        """Return the gradient groups required by the active 2x2 cell.
-
-        Phase 3 historically required both STAC-QM and the refiner.  Strict
-        Memory/refiner ablations intentionally enable either side alone, so
-        the connectivity assertion must follow the effective trainability
-        policy instead of requiring gradients from disabled modules.
+        """Return the gradient groups for the enabled query-memory and refiner modules.
         """
         required = []
         if getattr(model, 'query_memory_enabled', False):
@@ -415,5 +408,5 @@ class QueryMemoryPhase3ConnectivityOptimizerHook(
             runner.logger.warning(
                 'STAC-QM motion compensator final layer still has zero gradient '
                 f'at {self._RUN_LABEL} connectivity check; inspect motion '
-                'candidates before the formal run.')
+                'candidates.')
         self._connectivity_checked = True

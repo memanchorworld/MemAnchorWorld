@@ -157,7 +157,7 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
         self.query_memory_max_queries_per_frame = int(
             query_memory_max_queries_per_frame)
         self.query_memory_strict = bool(query_memory_strict)
-        # Problem 6: target-age history slot selection.
+        # History slots defined by target age.
         self.query_memory_history_selection_mode = str(
             query_memory_history_selection_mode)
         self.query_memory_history_target_ages = [
@@ -289,7 +289,7 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
         return history_infos
 
     def _build_target_age_history_infos(self, index):
-        """Assign one strictly-past frame to each target-age slot (Problem 6).
+        """Assign one strictly-past frame to each target-age slot.
 
         Slot ``j`` takes the causal same-scene frame whose base age is closest
         to ``history_target_ages[j]`` within ``history_age_tolerance``. No frame
@@ -303,21 +303,21 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
         used = set()
         history_infos = []
         for slot_index, target in enumerate(self.query_memory_history_target_ages):
-            best = None
-            best_gap = None
+            closest_index = None
+            closest_age_gap = None
             for cand_idx, info in enumerate(candidates):
                 if cand_idx in used:
                     continue
                 gap = abs(info['base_age'] - target)
                 if gap > tol:
                     continue
-                if best is None or gap < best_gap:
-                    best = cand_idx
-                    best_gap = gap
-            if best is None:
+                if closest_index is None or gap < closest_age_gap:
+                    closest_index = cand_idx
+                    closest_age_gap = gap
+            if closest_index is None:
                 continue
-            used.add(best)
-            info = dict(candidates[best])
+            used.add(closest_index)
+            info = dict(candidates[closest_index])
             info.pop('base_age', None)
             info['slot_index'] = slot_index
             info['target_age'] = float(target)
@@ -337,7 +337,6 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
         data_infos = list(sorted(data['infos'], key=lambda e: e['timestamp']))
         infos = []
 
-        # data_infos = data_infos[:39] #for debug
         self.metadata = data['metadata']
         self.version = self.metadata['version']
 
@@ -353,7 +352,7 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
                 self.temp2nusc_map.append(idx + 5)  # fair comparison with OccWorld
 
         # Cache precompute iterates this same public dataset index space. Restrict
-        # formal history candidates to frames for which that process can actually
+        # history candidates to frames for which that process can actually
         # produce a cache, so strict loading distinguishes missing generated files
         # from frames outside the split's valid model-input range.
         self._query_memory_cacheable_indices = set(self.temp2nusc_map)

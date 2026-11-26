@@ -97,7 +97,7 @@ class LoadQueryMemoryFromFiles(object):
         self.num_points = int(num_points)
         self.num_classes = int(num_classes)
         self.file_suffix = file_suffix
-        # Problem 6 (history selection) + Problem 5 (diversity selection).
+        # Target-age selection and query diversity.
         self.history_selection_mode = str(history_selection_mode)
         self.history_target_ages = [float(a) for a in history_target_ages]
         self.min_reliability = float(min_reliability)
@@ -408,7 +408,7 @@ class LoadQueryMemoryFromFiles(object):
                     f'memory schema: {semantic.shape[-1]} > {output_classes}')
             # Legacy/synthetic schema-v2 fixtures can contain a smaller class
             # vocabulary.  Pad into the configured model vocabulary while
-            # preserving the validated distribution; production NuScenes
+            # preserving the distribution. NuScenes
             # caches use the full 17-class dimension.
             memory['memory_semantic_distribution'][
                 out_index, :n, :semantic.shape[-1]] = semantic[:n]

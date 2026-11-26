@@ -254,7 +254,7 @@ def select_diverse_memory_queries(points_metric,
     def _cls(i):
         return labels_list[i] if use_labels else -1
 
-    # phase 1: prefer new class / new spatial cell, high reliability first
+    # Select reliable queries that add class or spatial coverage.
     for i in cand_sorted:
         if len(selected) >= max_queries:
             break
@@ -277,7 +277,7 @@ def select_diverse_memory_queries(points_metric,
             per_class[cls] = per_class.get(cls, 0) + 1
             seen_classes.add(cls)
 
-    # phase 2: fill remaining capacity by reliability under caps
+    # Fill the remaining capacity by reliability within the class and cell limits.
     for i in cand_sorted:
         if len(selected) >= max_queries:
             break
@@ -388,7 +388,7 @@ class QueryMemoryBank:
         self.max_queries_per_frame = int(max_queries_per_frame)
         self.write_threshold = float(write_threshold)
         self.max_time_gap = max_time_gap
-        # Problem 5 (diversity) + Problem 6 (target-age history selection).
+        # Query diversity and target-age selection.
         self.history_selection_mode = str(history_selection_mode)
         self.history_target_ages = [float(a) for a in history_target_ages]
         self.history_age_tolerance = float(history_age_tolerance)
@@ -488,7 +488,7 @@ class QueryMemoryBank:
         conf = query_conf[0].detach().float().cpu()
         points_cpu = query_points_metric[0].detach().float().cpu()
 
-        # schema-v2 per-query semantic reliability + label (Problem 4). When no
+        # schema-v2 per-query semantic reliability + label. When no
         # class logits are available fall back to conf as reliability, label=-1.
         if cls_scores is not None:
             rel_dict = compute_query_reliability(cls_scores[0].detach().cpu())
@@ -499,7 +499,7 @@ class QueryMemoryBank:
             labels = torch.full((conf.shape[0],), -1, dtype=torch.long)
 
         conf_ok = conf >= self.write_threshold
-        # deterministic reliability + class + spatial diversity (Problem 5),
+        # deterministic reliability + class + spatial diversity,
         # the SAME function the cache/loader use so online and offline agree.
         sel = select_diverse_memory_queries(
             points_cpu,
@@ -573,7 +573,7 @@ class QueryMemoryBank:
         return cands
 
     def _assign_target_age_slots(self, candidates):
-        """Greedily map candidates to target-age slots (Problem 6).
+        """Greedily map candidates to target-age slots.
 
         Slot ``j`` takes the strictly-past frame whose base age is closest to
         ``history_target_ages[j]`` within ``history_age_tolerance``. No frame is
@@ -583,20 +583,20 @@ class QueryMemoryBank:
         assigned = {}
         used = set()
         for j, target in enumerate(self.history_target_ages):
-            best = None
-            best_gap = None
+            closest_index = None
+            closest_age_gap = None
             for idx, (entry, age) in enumerate(candidates):
                 if idx in used:
                     continue
                 gap = abs(age - target)
                 if gap > self.history_age_tolerance:
                     continue
-                if best is None or gap < best_gap:
-                    best = idx
-                    best_gap = gap
-            if best is not None:
-                used.add(best)
-                assigned[j] = candidates[best]
+                if closest_index is None or gap < closest_age_gap:
+                    closest_index = idx
+                    closest_age_gap = gap
+            if closest_index is not None:
+                used.add(closest_index)
+                assigned[j] = candidates[closest_index]
         return assigned
 
     def read(self,
@@ -1019,7 +1019,7 @@ class ConfidenceGatedFusion(nn.Module):
     """Confidence-gated residual query fusion with LayerScale.
 
     ``alpha_init=0`` is retained as an explicit strict-identity option for
-    legacy STAC-QM modes.  Phase 3 uses a small nonzero alpha so the first
+    query-memory fusion. A small nonzero alpha lets the first
     backward pass reaches attention, gate, and projection parameters.
     """
 
@@ -1050,7 +1050,7 @@ class ConfidenceGatedFusion(nn.Module):
 
     @property
     def memory_norm(self):
-        """Named alias used by the Phase 3 fusion specification."""
+        """Return the normalization layer for memory features."""
         return self.norm_h
 
     def forward(self,
@@ -1260,8 +1260,8 @@ class STACQueryMemory(nn.Module):
 
         Scene-boundary samples can have no target-age history. In Memory-only
         training the base model is frozen, so returning ``query_feat`` directly
-        would produce a loss with no grad_fn and make both smoke and formal
-        optimizer hooks fail. Zero-valued anchors give every trainable STAC-QM
+        would produce a loss without a gradient function. Zero-valued anchors
+        give every trainable STAC-QM
         parameter an explicit zero gradient without inventing connectivity.
         """
         if not self.training:
@@ -1372,8 +1372,7 @@ class FutureMemoryAdapter(nn.Module):
 
         # Standard non-zero projections preserve a live second-step gradient
         # path.  Only residual-head last layers are zero so the initial output
-        # is exactly the baseline.  There is intentionally no tiny global
-        # alpha (the old Phase3 ``1e-3`` scale is not used here).
+        # equals the baseline at initialization.
         for layer in (self.query_proj, self.key_proj, self.value_proj,
                       self.out_proj, self.semantic_query_proj,
                       self.semantic_memory_proj):
@@ -1693,7 +1692,7 @@ def decode_semantic_occupancy_logits(base_logits, delta_s, delta_o, gate,
 
 
 class FutureMemoryAdapterV2(nn.Module):
-    """Two-stage geometry/semantic Query-to-Point future memory adapter.
+    """Future memory adapter with query retrieval and point attention.
 
     The original :class:`FutureMemoryAdapter` is intentionally retained for
     V1 checkpoint compatibility.  This class is output-only and consumes a
@@ -2479,9 +2478,8 @@ def sparse_soft_voxel_iou_loss(semantic_logits, occupancy_logits, points,
     voxels are materialised.  This avoids a dense ``B*200*200*16*17`` tensor
     while retaining gradients through continuous point positions.
 
-    The legacy grid uses corner indices (offset 0). The experimental
-    centre-aligned variant uses offset 0.5 so index k represents the centre
-    of GT voxel k. The default preserves existing V2 training behavior.
+    An offset of 0 aligns the grid to voxel corners. An offset of 0.5
+    aligns index k to the center of voxel k.
     """
     B, Q, R, C = semantic_logits.shape
     device = semantic_logits.device

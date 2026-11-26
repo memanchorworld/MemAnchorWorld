@@ -195,7 +195,7 @@ def main():
     log_file = osp.join(cfg.work_dir, f'{timestamp}.log')
     # specify logger name, if we still use 'mmdet', the output info will be
     # filtered and won't be saved in the log_file
-    # TODO: ugly workaround to judge whether we are training det or seg model
+    # Select the training API for detection or segmentation.
     if cfg.model.type in ['EncoderDecoder3D']:
         logger_name = 'mmseg'
     else:

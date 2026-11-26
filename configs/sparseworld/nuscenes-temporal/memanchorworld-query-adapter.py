@@ -1,20 +1,15 @@
-"""Code-level FutureMemoryAdapter configuration.
-
-This configuration is intentionally a finetuning/build fixture.  It loads the
-existing OPUS baseline checkpoint and fixed schema-v2 memory cache, but is not
-intended to be launched as a training or full-evaluation job in this phase.
+"""Query-level memory adapter with a frozen backbone.
 """
 
-_base_ = ['./sparseworld-traj-finetune-stacqm.py']
+_base_ = ['./memanchorworld-query-memory.py']
 
 load_from = 'ckpts/epoch_56.pth'
 resume_from = None
 
 future_memory_target_horizons = [1.0, 2.0, 3.0]
 
-# Keep the dataset/cache/evaluator inherited from the validated trajectory
-# baseline.  The model override explicitly disables every legacy STAC-QM and
-# Phase2/3/4 refiner route and enables only the independent output adapter.
+# Inherit the trajectory dataset and memory-cache configuration.
+# Apply memory corrections through the output adapter.
 model = dict(
     query_memory_cfg=dict(
         enabled=False,
@@ -36,13 +31,13 @@ model = dict(
             dropout=0.0,
             gate_bias=-1.0,
         ),
-        # Explicitly disable old MemoryConditionedRefiner/Phase routes.
+        # Disable query-memory fusion and the separate refiner.
         memory_conditioned_refiner=False,
         memory_finetune_mode=False,
         memory_joint_finetune_mode=False,
-        memory_phase2_finetune_mode=False,
-        memory_phase3_finetune_mode=False,
-        memory_phase3_future_only=False,
+        memory_joint_head_finetune_mode=False,
+        memory_refiner_finetune_mode=False,
+        memory_refiner_future_only=False,
     ),
 )
 
