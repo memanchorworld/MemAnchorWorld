@@ -259,8 +259,8 @@ def main():
     # MultiScaleFlipAug3D transforms, which is how the val/test pipeline is built)
     MEMORY_KEYS = {
         'memory_query_feat', 'memory_points_metric', 'memory_conf',
-        'memory_reliability', 'memory_label', 'memory_valid',
-        'memory_source_ego2global', 'memory_age'
+        'memory_reliability', 'memory_label', 'memory_semantic_distribution',
+        'memory_valid', 'memory_source_ego2global', 'memory_age'
     }
 
     def _sanitize_transform(p):
